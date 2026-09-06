@@ -250,6 +250,89 @@ pre-created strict correctness indexes in fixed eager then compiled-graph
 order. Both indexes must bind the same clean candidate, manifest, solver ABI,
 complete case set, and raw candidate NPZ archives.
 
+### Repeated-advance stability evidence
+
+`torch_memory_stability.py` is a focused correctness/stability collector for a
+small mixed material/source/CPML case. It is not a timing or throughput
+benchmark. A qualifying run requires compiled execution, a post-warm-up
+15-by-100 advance series, finite candidate and eager-reference live state at
+every sample, stable storage, clean post-warm-up compiler counters, and no
+dispatcher-visible full-domain copy/materialization event. CUDA records both
+live allocated and reserved samples. The collector deliberately does not claim
+that dispatcher profiling proves the absence of copies inside lowered kernels;
+that remains an explicit unverified criterion until separate lowering evidence
+is available.
+
+~~~sh
+uv run --no-sync python -m benchmarks.torch_memory_stability \
+  --device cuda:0 --compile-policy compile --mode qualify \
+  --warmup 10 --steps 100 --batches 15 --output /tmp/stability.json
+
+# This runs the same warm-up and collection path but makes no measured advance.
+# It is an observation-overhead control and can never qualify stability.
+uv run --no-sync python -m benchmarks.torch_memory_stability \
+  --device cpu --compile-policy eager --mode observation-control \
+  --warmup 10 --steps 100 --batches 15 --output /tmp/stability-control.json
+
+# Re-evaluation preserves the raw collector outcome; it is not a new run.
+uv run --no-sync python -m benchmarks.torch_memory_stability \
+  --reevaluate /tmp/stability.json --output /tmp/stability-reevaluated.json
+~~~
+
+Each collection binds its candidate commit/dirty status, collector hash, and
+runtime-source hash. A re-evaluation additionally binds the raw JSON hash, its
+original collector hash, and the current evaluator/runtime-source hashes; it
+records a current-check diagnostic separately from its effective decision. The
+effective decision can qualify only when the raw collection was already
+qualified and the current diagnostic remains qualified; it cannot promote a
+prior failed or partial collection into new evidence.
+The collector records one complete observer warmup separately before measured
+RSS begins. It preallocates the measured RSS, finite-state, field-error,
+storage, and CUDA telemetry, then reads RSS after the complete observation
+path. Storage and finite-state observation bind the existing module buffer
+path. CUDA telemetry takes one public allocator-stat snapshot per observation
+and fails closed unless both current totals are non-negative Python integers;
+it does not call the two separately flattening convenience accessors. Storage
+and finite-state observation bind the existing module buffer
+slots and data pointers once after solver warmup; measured samples do not
+rebuild `buffer_addresses()` or named-buffer dictionaries. This makes a
+first-use observer transition visible without excluding it from historical
+records or allowing per-sample report allocation to masquerade as simulation
+growth. Replacing a bound buffer, adding or removing a buffer key, or making a
+replacement non-finite fails the observation; captured stale tensors cannot
+mask a live-state change. Compare an advance series with its observation-only
+control before attributing an initial RSS transition to the solver. The control
+can identify collector or setup allocation, but it does not clear a later
+advance-series drift: that remains reported as unattributed until separately
+explained.
+`--advance-role candidate` and `--advance-role reference` are diagnostic
+controls for separating the two live simulations; neither can qualify
+stability.
+
+Use `--phase-progress` only to locate a bounded diagnostic timeout. It emits
+fixed stderr markers before and after warmup, observer priming, the complete
+measurement loop, and post-loop profiling; it emits nothing per sample and is
+not a substitute for the JSON evidence. A one-batch diagnostic is permitted
+for this purpose only and remains explicitly unqualified.
+
+`torch_lowered_materialization.py` is a standalone CUDA wrapper-output
+diagnostic. Run it in an isolated process with a fresh private Inductor cache
+and a new private output directory:
+
+~~~sh
+CACHE=/tmp/gmes-lowering-cache
+OUT=/tmp/gmes-lowering-output
+mkdir -m 700 "$CACHE"
+TORCHINDUCTOR_CACHE_DIR="$CACHE" uv run --no-sync python -m benchmarks.torch_lowered_materialization \
+  --case all-material-2d --device cuda:0 --precision float64 \
+  --warmup-steps 1 --cache-directory "$CACHE" --output-directory "$OUT"
+~~~
+
+Exact field-layout output candidates are diagnostic candidates, not clone
+findings. Opaque or unmapped wrapper paths remain unverified, and the raw
+generated-wrapper bundle is private diagnostic output that must not be added
+to Git.
+
 The final completion bundle embeds all three correctness indexes as full
 artifact descriptors: the CPU scope owns the CPU index, and the single-GPU
 scope owns the two CUDA indexes in fixed eager then compiled-graph order.

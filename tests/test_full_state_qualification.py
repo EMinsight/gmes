@@ -3,6 +3,7 @@
 import copy
 import sys
 import unittest
+from dataclasses import replace
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -78,6 +79,44 @@ class FullArrayComparatorTest(unittest.TestCase):
                 "failures"
             ],
             [{"key": key, "reason": "values"}],
+        )
+
+    def test_replay_aggregation_rejects_nested_source_auxiliary_clock_mutation(self):
+        state = {
+            "fields": {"Ex": np.zeros((1, 1, 1))},
+            "material": {"material/Ex/values": np.zeros(1)},
+            "sources": {"source/Ex/values": np.zeros(1)},
+            "auxiliaries": [
+                {
+                    "source_aux/0-TFSF/live_clock/time": np.asarray([0.1, 0.025]),
+                    "source_aux/0-TFSF/field/Ex": np.zeros((1, 1, 1)),
+                }
+            ],
+            "clocks": [{"source/time": np.asarray([0.1, 0.025])}],
+        }
+        expected = qualification._persistent_replay_arrays(state)
+        actual = copy.deepcopy(expected)
+        key = "source_auxiliary/rank-0/source_aux/0-TFSF/live_clock/time"
+        actual[key][0] += 0.125
+        self.assertFalse(
+            qualification.compare_arrays(
+                expected,
+                actual,
+                qualification._comparison_tolerances(
+                    expected, {"rtol": 1e-12, "atol": 1e-14}
+                ),
+            )["passed"]
+        )
+        actual = copy.deepcopy(expected)
+        actual[key][0] = np.nextafter(actual[key][0], np.inf)
+        self.assertFalse(
+            qualification.compare_arrays(
+                expected,
+                actual,
+                qualification._live_clock_tolerances(
+                    expected, {"rtol": 1e-12, "atol": 1e-14}
+                ),
+            )["passed"]
         )
 
     def test_missing_unexpected_and_broadcastable_shape_are_rejected(self):
@@ -237,73 +276,56 @@ class FullArrayComparatorTest(unittest.TestCase):
         passing_capture = {
             "field_comparison": {"passed": True},
             "material_comparison": {"passed": True},
+            "source_comparison": {"passed": True},
+            "source_auxiliary_comparisons": [{"comparison": {"passed": True}}],
+            "source_clock_comparisons": [{"comparison": {"passed": True}}],
         }
         passing_source = {"passed": True}
+        passing_auxiliaries = [{"comparison": {"passed": True}}]
         passing_clocks = [{"comparison": {"passed": True}}]
         passing_checkpoint = {"passed": True}
         arguments = (
             [passing_capture],
             passing_source,
+            passing_auxiliaries,
             passing_clocks,
             passing_checkpoint,
             [1, 1],
+            [1, 1],
+            [1, 1],
+            1,
         )
         self.assertTrue(qualification._two_gpu_report_passed(*arguments))
         self.assertEqual(qualification._two_gpu_report_exit_code({"passed": True}), 0)
-        failures = (
-            (
-                [
-                    {
-                        "field_comparison": {"passed": False},
-                        "material_comparison": {"passed": True},
-                    }
-                ],
-                passing_source,
-                passing_clocks,
-                passing_checkpoint,
-                [1, 1],
-            ),
-            (
-                [
-                    {
-                        "field_comparison": {"passed": True},
-                        "material_comparison": {"passed": False},
-                    }
-                ],
-                passing_source,
-                passing_clocks,
-                passing_checkpoint,
-                [1, 1],
-            ),
-            (
-                [passing_capture],
-                {"passed": False},
-                passing_clocks,
-                passing_checkpoint,
-                [1, 1],
-            ),
-            (
-                [passing_capture],
-                passing_source,
-                [{"comparison": {"passed": False}}],
-                passing_checkpoint,
-                [1, 1],
-            ),
-            (
-                [passing_capture],
-                passing_source,
-                passing_clocks,
-                {"passed": False},
-                [1, 1],
-            ),
-            (
-                [passing_capture],
-                passing_source,
-                passing_clocks,
-                passing_checkpoint,
-                [1, 0],
-            ),
-        )
+        failures = []
+        for name in (
+            "field_comparison",
+            "material_comparison",
+            "source_comparison",
+        ):
+            capture = dict(passing_capture)
+            capture[name] = {"passed": False}
+            failures.append(([capture], *arguments[1:]))
+        for name in (
+            "source_auxiliary_comparisons",
+            "source_clock_comparisons",
+        ):
+            capture = dict(passing_capture)
+            capture[name] = [{"comparison": {"passed": False}}]
+            failures.append(([capture], *arguments[1:]))
+        for index, value in (
+            (1, {"passed": False}),
+            (2, [{"comparison": {"passed": False}}]),
+            (3, [{"comparison": {"passed": False}}]),
+            (4, {"passed": False}),
+            (5, [1, 0]),
+            (6, [1, 0]),
+            (7, [1, 0]),
+            (8, 0),
+        ):
+            values = list(arguments)
+            values[index] = value
+            failures.append(tuple(values))
         for values in failures:
             with self.subTest(values=values):
                 self.assertFalse(qualification._two_gpu_report_passed(*values))
@@ -319,7 +341,7 @@ class FullArrayComparatorTest(unittest.TestCase):
                 self.subTest(exit_code=exit_code),
                 patch.object(
                     qualification, "run_two_gpu_partition_case", return_value=exit_code
-                ),
+                ) as runner,
                 patch.object(
                     sys,
                     "argv",
@@ -333,6 +355,245 @@ class FullArrayComparatorTest(unittest.TestCase):
                 ),
             ):
                 self.assertEqual(qualification.main(), exit_code)
+                self.assertEqual(runner.call_args.kwargs["compile_policy"], "eager")
+
+    def test_two_gpu_compile_policy_records_and_propagates_to_both_runtimes(self):
+        launch = SimpleNamespace(rank=0)
+        distributed_options = qualification._two_gpu_runtime_options(
+            "compile", launch=launch
+        )
+        serial_options = qualification._two_gpu_runtime_options("compile")
+        self.assertEqual(distributed_options["compile_policy"], "compile")
+        self.assertEqual(serial_options["compile_policy"], "compile")
+        self.assertIs(distributed_options["launch"], launch)
+        self.assertNotIn("launch", serial_options)
+        self.assertEqual(
+            qualification._two_gpu_execution_record("compile"),
+            {
+                "scope": "compiled-two-gpu-full-state-serial-torch-comparison",
+                "compile_policy": "compile",
+                "execution_mode": "graph",
+            },
+        )
+
+    def test_two_gpu_capture_is_disabled_by_default_and_ordered_for_compile(self):
+        calls = []
+
+        class Runtime:
+            def __init__(self, name):
+                self.name = name
+
+            def capture_cuda_graphs(self):
+                calls.append(self.name)
+
+        distributed = Runtime("distributed")
+        serial = Runtime("serial")
+        qualification._capture_two_gpu_compute_regions(
+            distributed, serial, rank=0, compile_policy="eager"
+        )
+        self.assertEqual(calls, [])
+        qualification._capture_two_gpu_compute_regions(
+            distributed, serial, rank=0, compile_policy="compile"
+        )
+        self.assertEqual(calls, ["distributed", "serial"])
+
+    def test_two_gpu_cli_accepts_compile_and_rejects_other_modes(self):
+        with (
+            patch.object(
+                qualification, "run_two_gpu_partition_case", return_value=0
+            ) as runner,
+            patch.object(
+                sys,
+                "argv",
+                [
+                    "full_state_qualification.py",
+                    "--mode",
+                    "two-gpu",
+                    "--compile-policy",
+                    "compile",
+                    "--output-dir",
+                    "unused-private-output",
+                ],
+            ),
+        ):
+            self.assertEqual(qualification.main(), 0)
+            self.assertEqual(runner.call_args.kwargs["compile_policy"], "compile")
+        with (
+            patch.object(
+                sys,
+                "argv",
+                [
+                    "full_state_qualification.py",
+                    "--mode",
+                    "analytic",
+                    "--compile-policy",
+                    "compile",
+                    "--output-dir",
+                    "unused-private-output",
+                ],
+            ),
+            self.assertRaisesRegex(SystemExit, "2") as error,
+        ):
+            qualification.main()
+        self.assertEqual(error.exception.code, 2)
+
+    def test_two_gpu_rejects_unknown_compile_policy_before_hardware_import(self):
+        with self.assertRaisesRegex(ValueError, "compile policy"):
+            qualification.run_two_gpu_partition_case(
+                "unused-private-output", compile_policy="automatic"
+            )
+
+
+class DistributedSourceCrossingTest(unittest.TestCase):
+    def test_rank_local_tfsf_crossing_matches_serial_source_and_auxiliary_state(self):
+        import gmes
+        from gmes.torch_distributed import TwoGpuDecomposition, rank_local_space
+        from gmes.torch_fdtd import DistributedLaunch, TorchSimulation
+
+        space = gmes.Cartesian((5, 4, 4), 1)
+        decomposition = TwoGpuDecomposition(
+            (5, 4, 4), 0, 2, (1.0, 1.0), (0.5, 0.5), 16, 1
+        )
+
+        def auxiliary_factory(**kwargs):
+            auxiliary_space = kwargs.pop("space")
+            auxiliary_runtime = kwargs.pop("runtime")
+            return TorchSimulation(
+                space=auxiliary_space,
+                runtime=replace(auxiliary_runtime, launch=DistributedLaunch()),
+                **kwargs,
+            )
+
+        def make_local(rank):
+            return TorchSimulation(
+                space=rank_local_space(space, decomposition, rank),
+                geometry=qualification._partition_geometry(gmes),
+                sources=qualification._partition_sources(gmes),
+                runtime=gmes.TorchRuntimeConfig(
+                    device="cpu",
+                    precision="float64",
+                    compile_policy="eager",
+                    cpu_threads=1,
+                    cpu_interop_threads=1,
+                    launch=DistributedLaunch(
+                        rank=rank,
+                        world_size=2,
+                        local_rank=rank,
+                        local_world_size=2,
+                    ),
+                ),
+                dt=0.025,
+                _distributed_partition=decomposition,
+                _auxiliary_factory=auxiliary_factory,
+            )
+
+        serial = TorchSimulation(
+            space=space,
+            geometry=qualification._partition_geometry(gmes),
+            sources=qualification._partition_sources(gmes),
+            runtime=gmes.TorchRuntimeConfig(
+                device="cpu", precision="float64", cpu_threads=1, cpu_interop_threads=1
+            ),
+            dt=0.025,
+        )
+        locals_ = tuple(make_local(rank) for rank in (0, 1))
+        local_rows = tuple(
+            qualification._source_rows(simulation, offset=decomposition.offset(rank))
+            for rank, simulation in enumerate(locals_)
+        )
+        self.assertTrue(
+            all(
+                qualification._transparent_source_ownership(rows) for rows in local_rows
+            )
+        )
+        for rows in local_rows:
+            total = sum(
+                len(value) for key, value in rows.items() if key.endswith("/indices")
+            )
+            self.assertEqual(
+                total,
+                qualification._point_source_ownership(rows)
+                + qualification._transparent_source_ownership(rows),
+            )
+        distributed_rows = qualification._canonical_rows(
+            (
+                (
+                    key.removesuffix("/indices"),
+                    values,
+                    rows[key.replace("/indices", "/values")],
+                )
+                for rows in local_rows
+                for key, values in rows.items()
+                if key.endswith("/indices")
+            )
+        )
+        serial_rows = qualification._source_rows(serial)
+        self.assertTrue(
+            qualification.compare_arrays(
+                serial_rows,
+                distributed_rows,
+                dict.fromkeys(serial_rows, {"rtol": 0.0, "atol": 0.0}),
+            )["passed"]
+        )
+        for simulation in (serial, *locals_):
+            simulation.sources.auxiliaries[0].advance(3)
+        serial_auxiliary = qualification._source_auxiliary_arrays(serial)
+        for simulation in locals_:
+            self.assertTrue(
+                qualification.compare_arrays(
+                    serial_auxiliary,
+                    qualification._source_auxiliary_arrays(simulation),
+                    qualification._comparison_tolerances(
+                        serial_auxiliary, {"rtol": 1e-12, "atol": 1e-14}
+                    ),
+                )["passed"]
+            )
+        baseline = qualification._source_auxiliary_arrays(serial)
+        auxiliary = serial.sources.auxiliaries[0]
+        self.assertFalse(np.any(auxiliary.host_snapshot()["Ey"]))
+        checkpoint_key = next(
+            key for key in baseline if key.endswith("/checkpoint/state/pml_ey_0_state")
+        )
+        pml_ey_before = auxiliary.state.pml_ey_0_state.clone()
+        auxiliary.state.pml_ey_0_state[0, 0].add_(0.125)
+        try:
+            self.assertFalse(
+                qualification.compare_arrays(
+                    baseline,
+                    qualification._source_auxiliary_arrays(serial),
+                    qualification._comparison_tolerances(
+                        baseline, {"rtol": 1e-12, "atol": 1e-14}
+                    ),
+                )["passed"]
+            )
+        finally:
+            auxiliary.state.pml_ey_0_state.copy_(pml_ey_before)
+        self.assertIn(checkpoint_key, baseline)
+        auxiliary.state.source_time.add_(0.125)
+        auxiliary.state.time_step.mul_(2)
+        self.assertFalse(
+            qualification.compare_arrays(
+                baseline,
+                qualification._source_auxiliary_arrays(serial),
+                qualification._comparison_tolerances(
+                    baseline, {"rtol": 1e-12, "atol": 1e-14}
+                ),
+            )["passed"]
+        )
+        live_clock = qualification._source_auxiliary_arrays(serial)
+        one_ulp_clock = copy.deepcopy(live_clock)
+        clock_key = next(key for key in live_clock if key.endswith("/live_clock/time"))
+        one_ulp_clock[clock_key][0] = np.nextafter(one_ulp_clock[clock_key][0], np.inf)
+        self.assertFalse(
+            qualification.compare_arrays(
+                live_clock,
+                one_ulp_clock,
+                qualification._live_clock_tolerances(
+                    live_clock,
+                    {"rtol": 1e-12, "atol": 1e-14},
+                ),
+            )["passed"]
+        )
 
 
 class NativeCaptureCompatibilityTest(unittest.TestCase):
@@ -373,6 +634,93 @@ class NativeCaptureCompatibilityTest(unittest.TestCase):
         self.assertEqual(row.shape, (1, 4))
         np.testing.assert_allclose(row[0, :3], (0.001, 1.7, 1.05), rtol=0, atol=0)
         self.assertTrue(np.isfinite(row[0, 3]))
+
+    def test_tfsf_capture_validation_rejects_batch_mutations(self):
+        import torch
+
+        from gmes.torch_source import TorchPointSourceBatch, TorchTransparentBatch
+
+        manifest = qualification.native_oracle.load_manifest()
+        spec = next(
+            case
+            for case in manifest["correctness"]
+            if case["name"] == "tfsf-transparent"
+        )
+        simulation = qualification.torch_correctness._build_torch_simulation(
+            spec,
+            dt=0.025,
+            threads=1,
+            device="cpu",
+            precision="float64",
+            graph_mode="eager",
+            compile_mode="default",
+        )
+        simulation.advance(1)
+        captured = {}
+        qualification.torch_correctness._independent_snapshot(simulation, 1, captured)
+        baseline = qualification._native_tfsf_capture_state(simulation, captured, 1)
+        self.assertTrue(baseline)
+        duplicate_targets = copy.deepcopy(captured)
+        duplicate_key = "torch/step/1/sources/batches/0/targets"
+        duplicate_targets[duplicate_key][1] = duplicate_targets[duplicate_key][0]
+        with self.assertRaisesRegex(ValueError, "batch layout"):
+            qualification._native_tfsf_capture_state(simulation, duplicate_targets, 1)
+        batch = next(
+            batch
+            for batch in simulation.sources.batches
+            if isinstance(batch, TorchTransparentBatch) and batch.component == "Ex"
+        )
+        original_samples = batch.samples
+        batch.samples = batch.samples.to(torch.float64) + 0.25
+        invalid_indices = {}
+        qualification.torch_correctness._independent_snapshot(
+            simulation, 1, invalid_indices
+        )
+        batch.samples = original_samples
+        with self.assertRaisesRegex(ValueError, "batch layout"):
+            qualification._native_tfsf_capture_state(simulation, invalid_indices, 1)
+        auxiliary = next(
+            item
+            for item in simulation.sources.auxiliaries[0].sources.batches
+            if isinstance(item, TorchPointSourceBatch)
+        )
+        original_amplitude = auxiliary.overwrite_amplitudes[0].detach().clone()
+        with torch.no_grad():
+            auxiliary.overwrite_amplitudes[0] = 1.125
+        invalid_auxiliary = {}
+        qualification.torch_correctness._independent_snapshot(
+            simulation, 1, invalid_auxiliary
+        )
+        with torch.no_grad():
+            auxiliary.overwrite_amplitudes[0] = original_amplitude
+        with self.assertRaisesRegex(ValueError, "auxiliary drive"):
+            qualification._native_tfsf_capture_state(simulation, invalid_auxiliary, 1)
+        original_weight = batch.weights[0, 0].detach().clone()
+        with torch.no_grad():
+            batch.weights[0, 0] = torch.nextafter(
+                batch.weights[0, 0],
+                torch.tensor(float("inf"), dtype=batch.weights.dtype),
+            )
+        before_capture = {}
+        qualification.torch_correctness._independent_snapshot(
+            simulation, 1, before_capture
+        )
+        with torch.no_grad():
+            batch.weights[0, 0] = original_weight
+        with self.assertRaisesRegex(ValueError, "source state changed"):
+            qualification._validate_native_tfsf_capture_stability(
+                baseline,
+                qualification._native_tfsf_capture_state(simulation, before_capture, 1),
+            )
+        with torch.no_grad():
+            batch.weights[0, 0] = torch.nextafter(
+                batch.weights[0, 0],
+                torch.tensor(float("inf"), dtype=batch.weights.dtype),
+            )
+        after_capture = qualification._native_tfsf_capture_state(
+            simulation, captured, 1
+        )
+        qualification._validate_native_tfsf_capture_stability(baseline, after_capture)
 
     def test_compatibility_retains_current_scientific_inputs(self):
         current = qualification.native_oracle.load_manifest()

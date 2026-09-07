@@ -27,6 +27,8 @@ KIND = "issue114-local-full-array-qualification-v1"
 COMPATIBILITY_KIND = "issue114-native-capture-schema-compatibility-v1"
 NATIVE_EXECUTION_SCOPE = "eager-full-state-native-correctness"
 TWO_GPU_EXECUTION_SCOPE = "eager-two-gpu-full-state-serial-torch-comparison"
+TWO_GPU_COMPILED_EXECUTION_SCOPE = "compiled-two-gpu-full-state-serial-torch-comparison"
+TWO_GPU_COMPILE_POLICIES = ("eager", "compile")
 LEGACY_OBSERVER_MANIFEST_SHA256 = (
     "1646db1a9d7b8d1f15a6336527e63c669deca188cf6429d9c21b4fed8c93bb29"
 )
@@ -403,6 +405,109 @@ def read_native_reference(path, manifest):
     )
 
 
+def _native_tfsf_auxiliary_drive(simulation, batch, captured, step):
+    from gmes.torch_source import TorchPointSourceBatch
+
+    matches = [
+        ordinal
+        for ordinal, auxiliary in enumerate(simulation.sources.auxiliaries)
+        if auxiliary is batch.auxiliary
+    ]
+    if len(matches) != 1:
+        raise ValueError("live TFSF batch auxiliary ownership is ambiguous")
+    auxiliary_batches = [
+        item
+        for item in batch.auxiliary.sources.batches
+        if isinstance(item, TorchPointSourceBatch)
+    ]
+    if (
+        len(auxiliary_batches) != 1
+        or auxiliary_batches[0].component != "Ex"
+        or auxiliary_batches[0].paired_real
+    ):
+        raise ValueError("live TFSF auxiliary source layout is unsupported")
+    root = f"torch/step/{step}/auxiliary/{matches[0]}/sources/batches/0"
+    try:
+        targets = np.asarray(captured[f"{root}/overwrite_targets"])
+        models = np.asarray(captured[f"{root}/overwrite_models"])
+        parameters = np.asarray(captured[f"{root}/overwrite_parameters"])
+        amplitudes = np.asarray(captured[f"{root}/overwrite_amplitudes"])
+        additive_targets = np.asarray(captured[f"{root}/additive_targets"])
+    except KeyError as error:
+        raise ValueError(
+            "captured TFSF auxiliary source state is incomplete"
+        ) from error
+    if (
+        targets.dtype != np.dtype(np.int64)
+        or targets.shape != (1,)
+        or models.dtype != np.dtype(np.int8)
+        or models.shape != (1,)
+        or parameters.dtype != np.dtype(np.float64)
+        or parameters.shape != (1, 6)
+        or amplitudes.dtype != np.dtype(np.float64)
+        or amplitudes.shape != (1,)
+        or additive_targets.dtype != np.dtype(np.int64)
+        or additive_targets.shape != (0,)
+        or not bool(np.isfinite(amplitudes).all())
+        or not np.array_equal(amplitudes, np.ones(1, dtype=np.float64))
+    ):
+        raise ValueError("captured TFSF auxiliary drive is unsupported")
+
+
+def _native_tfsf_capture_state(simulation, captured, step):
+    from gmes.torch_source import TorchTransparentBatch
+
+    batches = [
+        (ordinal, batch)
+        for ordinal, batch in enumerate(simulation.sources.batches)
+        if isinstance(batch, TorchTransparentBatch)
+    ]
+    if not batches or len({id(batch.auxiliary) for _ordinal, batch in batches}) != 1:
+        raise ValueError("live TFSF auxiliary plan is unsupported")
+    state = {}
+    for ordinal, batch in batches:
+        root = f"torch/step/{step}/sources/batches/{ordinal}"
+        try:
+            targets = np.asarray(captured[f"{root}/targets"])
+            samples = np.asarray(captured[f"{root}/samples"])
+            weights = np.asarray(captured[f"{root}/weights"])
+        except KeyError as error:
+            raise ValueError("captured TFSF batch state is incomplete") from error
+        if (
+            targets.dtype != np.dtype(np.int64)
+            or samples.dtype != np.dtype(np.int64)
+            or weights.dtype != np.dtype(np.float64)
+            or targets.ndim != 1
+            or samples.shape != (len(targets), 2)
+            or weights.shape != samples.shape
+            or len(set(int(target) for target in targets)) != len(targets)
+            or not bool(np.isfinite(weights).all())
+        ):
+            raise ValueError("captured TFSF batch layout is unsupported")
+        _native_tfsf_auxiliary_drive(simulation, batch, captured, step)
+        for name, value in (
+            ("targets", targets),
+            ("samples", samples),
+            ("weights", weights),
+        ):
+            state[f"{ordinal}/{name}"] = value.copy()
+    return state
+
+
+def _validate_native_tfsf_capture_stability(baseline, candidate):
+    if set(baseline) != set(candidate):
+        raise ValueError("captured TFSF source schema changed")
+    for key in baseline:
+        before = baseline[key]
+        after = candidate[key]
+        if (
+            before.dtype != after.dtype
+            or before.shape != after.shape
+            or not np.array_equal(before, after)
+        ):
+            raise ValueError("captured TFSF source state changed")
+
+
 def _point_observables(simulation, step, arrays):
     """Project actual packed point waveforms to the observer's amp/value layout."""
     import torch
@@ -506,9 +611,18 @@ def run_native_case(reference, manifest, *, precision, output, device="cpu"):
         torch_correctness._logical_geometry_metadata(spec, dt),
     )
     completed = 0
+    native_tfsf_baseline = None
     for step in captures:
         simulation.advance(step - completed)
         torch_correctness._independent_snapshot(simulation, step, actual)
+        if spec.get("name") == "tfsf-transparent":
+            captured_tfsf = _native_tfsf_capture_state(simulation, actual, step)
+            if native_tfsf_baseline is None:
+                native_tfsf_baseline = captured_tfsf
+            else:
+                _validate_native_tfsf_capture_stability(
+                    native_tfsf_baseline, captured_tfsf
+                )
         _point_observables(simulation, step, actual)
         completed = step
     raw_keys = [key for key in actual if key.startswith("torch/")]
@@ -516,7 +630,7 @@ def run_native_case(reference, manifest, *, precision, output, device="cpu"):
     validate_capture_contract(actual, captures, shapes, precision=precision)
     unresolved = []
     # Transparent packed parameters and native face descriptors use different
-    # layouts. Do not compare their bit patterns or certify an omitted mapping.
+    # layouts, so native transparent value arrays remain unqualified.
     omitted = [
         key
         for key in expected
@@ -795,7 +909,7 @@ def _partition_geometry(gmes):
 
 
 def _partition_sources(gmes):
-    """Return ordered sources owned on both sides of the forced cut."""
+    """Return point and TFSF sources owned on both sides of the forced cut."""
     waveform = gmes.DifferentiatedGaussian(0.7, 0.3)
     return (
         gmes.PointSource(waveform, center=(-2, 0, 0), component=gmes.Ex, amp=1),
@@ -803,6 +917,15 @@ def _partition_sources(gmes):
         gmes.PointSource(waveform, center=(-1, 0, 0), component=gmes.Ey, amp=3),
         # Same Ex target: the final record must be the one surviving on rank 0.
         gmes.PointSource(waveform, center=(-1, 0, 0), component=gmes.Ex, amp=4),
+        # This supported direct TFSF face region straddles the forced x cut.
+        gmes.TotalFieldScatteredField(
+            gmes.Continuous(0.2, phase=0.2, width=1),
+            center=(0, 0, 0),
+            size=(3, 3, 3),
+            direction=(1, 0, 0),
+            polarization=(0, 1, 0),
+            amp=0.3,
+        ),
     )
 
 
@@ -879,29 +1002,78 @@ def _material_rows(simulation, *, offset=(0, 0, 0), rank=None, split_axis=None):
     return _canonical_rows(parts)
 
 
-def _point_source_rows(simulation, *, offset=(0, 0, 0)):
-    """Canonicalize actual point batch parameters without native archive input."""
-    from gmes.torch_source import TorchPointSourceBatch
-
+def _source_rows(simulation, *, offset=(0, 0, 0)):
+    """Canonicalize owned point and transparent source batch payloads."""
     parts = []
     for batch in simulation.sources.batches:
-        if not isinstance(batch, TorchPointSourceBatch):
-            raise ValueError("two-GPU state case requires point-source batches")
-        shape = simulation.plan.shapes[batch.component]
-        for kind in ("overwrite", "additive"):
-            targets = getattr(batch, f"{kind}_targets").detach().cpu().numpy()
-            models = getattr(batch, f"{kind}_models").detach().cpu().numpy()
-            parameters = getattr(batch, f"{kind}_parameters").detach().cpu().numpy()
-            amplitudes = getattr(batch, f"{kind}_amplitudes").detach().cpu().numpy()
-            if not len(targets):
-                continue
-            indices = np.column_stack(np.unravel_index(targets, shape)).astype(
-                np.int64, copy=False
+        native_type, representation, indices, values = (
+            torch_correctness._source_batch_payload(simulation, batch)
+        )
+        if not len(indices):
+            continue
+        indices = np.asarray(indices, dtype=np.int64).copy()
+        indices += np.asarray(offset, dtype=np.int64)
+        values = np.asarray(values)
+        if values.ndim != 1 or values.size % len(indices):
+            raise ValueError("source batch payload cannot be partitioned by target")
+        parts.append(
+            (
+                f"source/{batch.component}/{native_type}/{representation}",
+                indices,
+                values.reshape(len(indices), -1),
             )
-            indices += np.asarray(offset, dtype=np.int64)
-            values = np.column_stack((models, amplitudes, parameters))
-            parts.append((f"source/{batch.component}/{kind}", indices, values))
+        )
     return _canonical_rows(parts)
+
+
+def _source_auxiliary_arrays(simulation):
+    """Capture live transparent-source auxiliary state without an oracle archive."""
+    arrays = {}
+    records = torch_correctness._independent_source_records(simulation, 0, arrays)
+    if not records["auxiliary"]:
+        raise ValueError("partition-crossing source requires a transparent auxiliary")
+    prefix = "step/0/"
+    result = {
+        key.removeprefix(prefix): value
+        for key, value in arrays.items()
+        if key.startswith(f"{prefix}source_aux/")
+        or key.startswith(f"{prefix}source_aux_material/")
+    }
+    if not result:
+        raise ValueError("transparent auxiliary state capture is empty")
+    for ordinal, (record, auxiliary) in enumerate(
+        zip(records["auxiliary"], simulation.sources.auxiliaries, strict=True)
+    ):
+        checkpoint_prefix = f"source_aux/{ordinal}-{record['source']}/checkpoint/state"
+        for name, value in auxiliary.state.checkpoint().items():
+            result[f"{checkpoint_prefix}/{name}"] = torch_correctness._host(value)
+        clock = _source_clock(auxiliary)
+        prefix = f"source_aux/{ordinal}-{record['source']}/live_clock"
+        result[f"{prefix}/step_count"] = clock["source/step_count"]
+        result[f"{prefix}/time"] = clock["source/time"]
+    return result
+
+
+def _transparent_source_ownership(rows):
+    """Count owned direct TFSF/Gaussian face targets from live source rows."""
+    return sum(
+        len(value)
+        for key, value in rows.items()
+        if key.startswith("source/")
+        and "/Transparent" in key
+        and key.endswith("/indices")
+    )
+
+
+def _point_source_ownership(rows):
+    """Count only direct point-source targets, never transparent face rows."""
+    return sum(
+        len(value)
+        for key, value in rows.items()
+        if key.startswith("source/")
+        and "/PointSource" in key
+        and key.endswith("/indices")
+    )
 
 
 def _source_clock(simulation):
@@ -921,6 +1093,89 @@ def _source_clock(simulation):
     }
 
 
+def _canonical_distributed_rows(gathered_rows):
+    """Merge exact owned rows from every rank and reject duplicate ownership."""
+    return _canonical_rows(
+        (
+            (
+                key.removesuffix("/indices"),
+                value,
+                gathered[key.replace("/indices", "/values")],
+            )
+            for gathered in gathered_rows
+            for key, value in gathered.items()
+            if key.endswith("/indices")
+        )
+    )
+
+
+def _distributed_live_state(distributed, launch, dist):
+    """Collect fields plus all rank-local persistent source/material state."""
+    global_fields = distributed.global_field_snapshot()
+    local_material = _material_rows(
+        distributed.local,
+        offset=distributed.decomposition.offset(launch.rank),
+        rank=launch.rank,
+        split_axis=distributed.decomposition.axis,
+    )
+    local_sources = _source_rows(
+        distributed.local, offset=distributed.decomposition.offset(launch.rank)
+    )
+    local_auxiliary = _source_auxiliary_arrays(distributed.local)
+    local_clock = _source_clock(distributed.local)
+    gathered_material = [None, None]
+    gathered_sources = [None, None]
+    gathered_auxiliary = [None, None]
+    gathered_clocks = [None, None]
+    for gathered, local in (
+        (gathered_material, local_material),
+        (gathered_sources, local_sources),
+        (gathered_auxiliary, local_auxiliary),
+        (gathered_clocks, local_clock),
+    ):
+        dist.all_gather_object(gathered, local, group=distributed.group)
+    if launch.rank != 0:
+        return None
+    return {
+        "fields": global_fields,
+        "material": _canonical_distributed_rows(gathered_material),
+        "sources": _canonical_distributed_rows(gathered_sources),
+        "auxiliaries": gathered_auxiliary,
+        "clocks": gathered_clocks,
+        "source_ownership": [
+            sum(len(value) for key, value in rows.items() if key.endswith("/indices"))
+            for rows in gathered_sources
+        ],
+        "point_source_ownership": [
+            _point_source_ownership(rows) for rows in gathered_sources
+        ],
+        "transparent_source_ownership": [
+            _transparent_source_ownership(rows) for rows in gathered_sources
+        ],
+    }
+
+
+def _persistent_replay_arrays(state):
+    """Flatten complete distributed state for exact post-checkpoint replay checks."""
+    arrays = {f"field/{key}": value for key, value in state["fields"].items()}
+    arrays.update(
+        {f"material/{key}": value for key, value in state["material"].items()}
+    )
+    arrays.update({f"source/{key}": value for key, value in state["sources"].items()})
+    for rank, auxiliary in enumerate(state["auxiliaries"]):
+        arrays.update(
+            {
+                f"source_auxiliary/rank-{rank}/{key}": value
+                for key, value in auxiliary.items()
+            }
+        )
+    for rank, clock in enumerate(state["clocks"]):
+        arrays.update(
+            {f"source_clock/rank-{rank}/{key}": value for key, value in clock.items()}
+        )
+    return arrays
+
+
 def _comparison_tolerances(arrays, tolerance):
     """Use exact topology and one frozen tolerance for each numeric state row."""
     return {
@@ -928,6 +1183,16 @@ def _comparison_tolerances(arrays, tolerance):
         for key, value in arrays.items()
         if np.asarray(value).dtype.kind not in "biu"
     }
+
+
+def _live_clock_tolerances(arrays, tolerance):
+    """Keep live scheduling clocks exact while retaining physical tolerances."""
+    result = _comparison_tolerances(arrays, tolerance)
+    for key, value in arrays.items():
+        if "/live_clock/" in key or key.startswith("source_clock/"):
+            if np.asarray(value).dtype.kind not in "biu":
+                result[key] = {"rtol": 0.0, "atol": 0.0}
+    return result
 
 
 def _public_device_metadata(logical, properties):
@@ -938,20 +1203,38 @@ def _public_device_metadata(logical, properties):
 def _two_gpu_report_passed(
     captures,
     source_comparison,
+    source_auxiliary_comparisons,
     source_clock_comparisons,
     checkpoint_comparison,
     source_ownership,
+    point_source_ownership,
+    transparent_source_ownership,
+    source_crossings,
 ):
     """Combine every required two-rank comparison without hiding a failure."""
     return (
         all(
-            item["field_comparison"]["passed"] and item["material_comparison"]["passed"]
+            item["field_comparison"]["passed"]
+            and item["material_comparison"]["passed"]
+            and item["source_comparison"]["passed"]
+            and all(
+                comparison["comparison"]["passed"]
+                for comparison in item["source_auxiliary_comparisons"]
+            )
+            and all(
+                comparison["comparison"]["passed"]
+                for comparison in item["source_clock_comparisons"]
+            )
             for item in captures
         )
         and source_comparison["passed"]
+        and all(item["comparison"]["passed"] for item in source_auxiliary_comparisons)
         and all(item["comparison"]["passed"] for item in source_clock_comparisons)
         and checkpoint_comparison["passed"]
         and all(source_ownership)
+        and all(point_source_ownership)
+        and all(transparent_source_ownership)
+        and source_crossings > 0
     )
 
 
@@ -963,13 +1246,60 @@ def _two_gpu_report_exit_code(report):
     return 0 if passed else 1
 
 
-def run_two_gpu_partition_case(output):
-    """Run one eager serial-versus-two-GPU full field/state partition case.
+def _two_gpu_execution_record(compile_policy):
+    """Describe the selected local execution policy without production authority."""
+    if compile_policy not in TWO_GPU_COMPILE_POLICIES:
+        raise ValueError("two-GPU compile policy must be 'eager' or 'compile'")
+    if compile_policy == "compile":
+        return {
+            "scope": TWO_GPU_COMPILED_EXECUTION_SCOPE,
+            "compile_policy": compile_policy,
+            "execution_mode": "graph",
+        }
+    return {
+        "scope": TWO_GPU_EXECUTION_SCOPE,
+        "compile_policy": compile_policy,
+        "execution_mode": "eager",
+    }
+
+
+def _two_gpu_runtime_options(compile_policy, *, launch=None):
+    """Keep the serial and distributed runtime policies identical."""
+    _two_gpu_execution_record(compile_policy)
+    options = {
+        "precision": "float64",
+        "compile_policy": compile_policy,
+        "execution_policy": "auto",
+        "cpu_threads": 1,
+        "cpu_interop_threads": 1,
+    }
+    if launch is not None:
+        options["launch"] = launch
+    return options
+
+
+def _capture_two_gpu_compute_regions(distributed, serial, *, rank, compile_policy):
+    """Capture both post-load compute regions only for the explicit graph policy."""
+    if compile_policy == "eager":
+        return
+    _two_gpu_execution_record(compile_policy)
+    distributed.capture_cuda_graphs()
+    if rank == 0:
+        if serial is None:
+            raise ValueError("rank zero serial runtime is required for graph capture")
+        serial.capture_cuda_graphs()
+
+
+def run_two_gpu_partition_case(output, *, compile_policy="eager"):
+    """Run one serial-versus-two-GPU full field/state partition case.
 
     This is a distributed Torch correctness check, not native qualification and
-    not compiler qualification. It must be started under exactly two torchrun
-    ranks and writes its private evidence only on rank zero.
+    not production qualification. ``compile_policy='compile'`` explicitly
+    captures the same post-load compute regions for both runtimes. It must be
+    started under exactly two torchrun ranks and writes private evidence only
+    on rank zero.
     """
+    execution = _two_gpu_execution_record(compile_policy)
     import torch
     import torch.distributed as dist
 
@@ -993,12 +1323,7 @@ def run_two_gpu_partition_case(output):
     )
     runtime = gmes.TorchRuntimeConfig(
         device=f"cuda:{launch.local_rank}",
-        precision="float64",
-        compile_policy="eager",
-        execution_policy="auto",
-        cpu_threads=1,
-        cpu_interop_threads=1,
-        launch=launch,
+        **_two_gpu_runtime_options(compile_policy, launch=launch),
     )
     distributed = gmes.TorchDistributedSimulation(
         space=space,
@@ -1016,14 +1341,16 @@ def run_two_gpu_partition_case(output):
             sources=_partition_sources(gmes),
             runtime=gmes.TorchRuntimeConfig(
                 device="cuda:0",
-                precision="float64",
-                compile_policy="eager",
-                execution_policy="auto",
-                cpu_threads=1,
-                cpu_interop_threads=1,
+                **_two_gpu_runtime_options(compile_policy),
             ),
             dt=0.025,
         ).load_host_fields(fields)
+    _capture_two_gpu_compute_regions(
+        distributed,
+        serial if launch.rank == 0 else None,
+        rank=launch.rank,
+        compile_policy=compile_policy,
+    )
     distributed.advance(2)
     if launch.rank == 0:
         serial.advance(2)
@@ -1032,118 +1359,48 @@ def run_two_gpu_partition_case(output):
     raw = {}
     capture_results = []
     tolerance = native_oracle.load_manifest()["tolerances"]["torch"]["drude"]["float64"]
+    source_ownership = None
+    point_source_ownership = None
+    transparent_source_ownership = None
     for relative_step in captures:
         distributed.advance(relative_step - completed)
         if launch.rank == 0:
             serial.advance(relative_step - completed)
         completed = relative_step
-        global_fields = distributed.global_field_snapshot()
-        local_material = _material_rows(
-            distributed.local,
-            offset=distributed.decomposition.offset(launch.rank),
-            rank=launch.rank,
-            split_axis=distributed.decomposition.axis,
-        )
-        gathered_material = [None, None]
-        dist.all_gather_object(
-            gathered_material, local_material, group=distributed.group
-        )
+        distributed_state = _distributed_live_state(distributed, launch, dist)
         if launch.rank != 0:
             continue
         serial_fields = serial.host_snapshot()
         serial_material = _material_rows(serial)
-        distributed_material = _canonical_rows(
-            (
-                (
-                    key.removesuffix("/indices"),
-                    value,
-                    gathered[key.replace("/indices", "/values")],
-                )
-                for gathered in gathered_material
-                for key, value in gathered.items()
-                if key.endswith("/indices")
-            )
-        )
+        serial_sources = _source_rows(serial)
+        serial_source_clock = _source_clock(serial)
+        serial_source_auxiliary = _source_auxiliary_arrays(serial)
         field_comparison = compare_arrays(
             serial_fields,
-            global_fields,
+            distributed_state["fields"],
             dict.fromkeys(serial_fields, tolerance),
         )
         material_comparison = compare_arrays(
             serial_material,
-            distributed_material,
+            distributed_state["material"],
             _comparison_tolerances(serial_material, tolerance),
-        )
-        for name in COMPONENTS:
-            raw[f"capture/{relative_step}/serial/{name}"] = serial_fields[name]
-            raw[f"capture/{relative_step}/distributed/{name}"] = global_fields[name]
-        for key, value in serial_material.items():
-            raw[f"capture/{relative_step}/serial/{key}"] = value
-        for key, value in distributed_material.items():
-            raw[f"capture/{relative_step}/distributed/{key}"] = value
-        capture_results.append(
-            {
-                "relative_step": relative_step,
-                "field_comparison": field_comparison,
-                "material_comparison": material_comparison,
-            }
-        )
-    local_sources = _point_source_rows(
-        distributed.local, offset=distributed.decomposition.offset(launch.rank)
-    )
-    gathered_sources = [None, None]
-    dist.all_gather_object(gathered_sources, local_sources, group=distributed.group)
-    gathered_source_clocks = [None, None]
-    dist.all_gather_object(
-        gathered_source_clocks,
-        _source_clock(distributed.local),
-        group=distributed.group,
-    )
-    local_source_ownership = sum(
-        len(value) for key, value in local_sources.items() if key.endswith("/indices")
-    )
-    source_ownership = [None, None]
-    dist.all_gather_object(
-        source_ownership, local_source_ownership, group=distributed.group
-    )
-    if launch.rank == 0:
-        serial_sources = _point_source_rows(serial)
-        serial_source_clock = _source_clock(serial)
-    checkpoint = distributed.checkpoint()
-    distributed.advance(5)
-    if launch.rank == 0:
-        serial_checkpoint = serial.checkpoint()
-        serial.advance(5)
-    replay_fields = distributed.global_field_snapshot()
-    distributed.load_checkpoint(checkpoint).advance(5)
-    if launch.rank == 0:
-        serial.load_checkpoint(serial_checkpoint).advance(5)
-    replay_again = distributed.global_field_snapshot()
-    devices = [None, None]
-    local_device = torch.cuda.get_device_properties(launch.local_rank)
-    dist.all_gather_object(
-        devices,
-        _public_device_metadata(launch.local_rank, local_device),
-        group=distributed.group,
-    )
-    if launch.rank == 0:
-        distributed_sources = _canonical_rows(
-            (
-                (
-                    key.removesuffix("/indices"),
-                    value,
-                    gathered[key.replace("/indices", "/values")],
-                )
-                for gathered in gathered_sources
-                for key, value in gathered.items()
-                if key.endswith("/indices")
-            )
         )
         source_comparison = compare_arrays(
             serial_sources,
-            distributed_sources,
+            distributed_state["sources"],
             dict.fromkeys(serial_sources, {"rtol": 0.0, "atol": 0.0}),
         )
+        source_auxiliary_comparisons = [
+            {
+                "rank": rank,
+                "comparison": compare_arrays(
+                    serial_source_auxiliary,
+                    remote_auxiliary,
+                    _live_clock_tolerances(serial_source_auxiliary, tolerance),
+                ),
+            }
+            for rank, remote_auxiliary in enumerate(distributed_state["auxiliaries"])
+        ]
         source_clock_comparisons = [
             {
                 "rank": rank,
@@ -1153,30 +1410,88 @@ def run_two_gpu_partition_case(output):
                     {"source/time": {"rtol": 0.0, "atol": 0.0}},
                 ),
             }
-            for rank, remote_clock in enumerate(gathered_source_clocks)
+            for rank, remote_clock in enumerate(distributed_state["clocks"])
         ]
-        replay_comparison = compare_arrays(
-            replay_fields, replay_again, dict.fromkeys(replay_fields, tolerance)
-        )
+        if relative_step == captures[0]:
+            source_ownership = distributed_state["source_ownership"]
+            point_source_ownership = distributed_state["point_source_ownership"]
+            transparent_source_ownership = distributed_state[
+                "transparent_source_ownership"
+            ]
         for name in COMPONENTS:
-            raw[f"checkpoint/expected/{name}"] = replay_fields[name]
-            raw[f"checkpoint/replay/{name}"] = replay_again[name]
-        for key, value in serial_sources.items():
-            raw[f"source/serial/{key}"] = value
-        for key, value in distributed_sources.items():
-            raw[f"source/distributed/{key}"] = value
-        for key, value in serial_source_clock.items():
-            raw[f"source/serial/{key}"] = value
-        for rank, remote_clock in enumerate(gathered_source_clocks):
-            for key, value in remote_clock.items():
-                raw[f"source/distributed-rank-{rank}/{key}"] = value
+            raw[f"capture/{relative_step}/serial/{name}"] = serial_fields[name]
+            raw[f"capture/{relative_step}/distributed/{name}"] = distributed_state[
+                "fields"
+            ][name]
+        for key, value in serial_material.items():
+            raw[f"capture/{relative_step}/serial/{key}"] = value
+        for key, value in distributed_state["material"].items():
+            raw[f"capture/{relative_step}/distributed/{key}"] = value
+        for prefix, arrays in (
+            ("serial/source", serial_sources),
+            ("distributed/source", distributed_state["sources"]),
+            ("serial/source_clock", serial_source_clock),
+            ("serial/source_auxiliary", serial_source_auxiliary),
+        ):
+            for key, value in arrays.items():
+                raw[f"capture/{relative_step}/{prefix}/{key}"] = value
+        for rank, values in enumerate(distributed_state["clocks"]):
+            for key, value in values.items():
+                raw[f"capture/{relative_step}/distributed/rank-{rank}/clock/{key}"] = (
+                    value
+                )
+        for rank, values in enumerate(distributed_state["auxiliaries"]):
+            for key, value in values.items():
+                raw[
+                    f"capture/{relative_step}/distributed/rank-{rank}/auxiliary/{key}"
+                ] = value
+        capture_results.append(
+            {
+                "relative_step": relative_step,
+                "field_comparison": field_comparison,
+                "material_comparison": material_comparison,
+                "source_comparison": source_comparison,
+                "source_auxiliary_comparisons": source_auxiliary_comparisons,
+                "source_clock_comparisons": source_clock_comparisons,
+            }
+        )
+    checkpoint = distributed.checkpoint()
+    distributed.advance(5)
+    checkpoint_expected = _distributed_live_state(distributed, launch, dist)
+    distributed.load_checkpoint(checkpoint).advance(5)
+    checkpoint_replay = _distributed_live_state(distributed, launch, dist)
+    devices = [None, None]
+    local_device = torch.cuda.get_device_properties(launch.local_rank)
+    dist.all_gather_object(
+        devices,
+        _public_device_metadata(launch.local_rank, local_device),
+        group=distributed.group,
+    )
+    if launch.rank == 0:
+        checkpoint_expected_arrays = _persistent_replay_arrays(checkpoint_expected)
+        checkpoint_replay_arrays = _persistent_replay_arrays(checkpoint_replay)
+        replay_comparison = compare_arrays(
+            checkpoint_expected_arrays,
+            checkpoint_replay_arrays,
+            _live_clock_tolerances(checkpoint_expected_arrays, tolerance),
+        )
+        for label, arrays in (
+            ("expected", checkpoint_expected_arrays),
+            ("replay", checkpoint_replay_arrays),
+        ):
+            for key, value in arrays.items():
+                raw[f"checkpoint/{label}/{key}"] = value
+        source_comparison = capture_results[-1]["source_comparison"]
+        source_auxiliary_comparisons = capture_results[-1][
+            "source_auxiliary_comparisons"
+        ]
+        source_clock_comparisons = capture_results[-1]["source_clock_comparisons"]
         raw_path = output / "raw-arrays.npz"
         np.savez_compressed(raw_path, **raw)
         report = {
             "kind": KIND,
-            "scope": TWO_GPU_EXECUTION_SCOPE,
+            **execution,
             "native_qualification": False,
-            "compile_policy": "eager",
             "execution_policy": "auto",
             "case": {
                 "space": [5, 4, 4],
@@ -1187,18 +1502,23 @@ def run_two_gpu_partition_case(output):
                 "capture_steps": list(captures),
                 "drude_block_crosses_partition": True,
                 "ordered_point_sources": 4,
-                "point_source_ownership": source_ownership,
-                "source_crossings": 0,
+                "point_source_ownership": point_source_ownership,
+                "source_ownership": source_ownership,
+                "source_crossings": distributed.decomposition.source_crossings,
+                "transparent_source_ownership": transparent_source_ownership,
                 "source_coverage": (
-                    "point-source ownership and same-target last-wins on both ranks; "
-                    "this case does not claim an extended-source footprint crossing"
+                    "point-source ownership and same-target last-wins, plus one direct "
+                    "TFSF face region with owned targets on both sides of the forced cut"
                 ),
             },
             "devices": sorted(devices, key=lambda value: value["logical"]),
             "captures": capture_results,
             "source_comparison": source_comparison,
+            "source_auxiliary_comparisons": source_auxiliary_comparisons,
             "source_clock_comparisons": source_clock_comparisons,
             "source_ownership_passed": all(source_ownership),
+            "point_source_ownership_passed": all(point_source_ownership),
+            "transparent_source_ownership_passed": all(transparent_source_ownership),
             "checkpoint_comparison": replay_comparison,
             "candidate": candidate_provenance(),
             "raw_arrays": {
@@ -1210,9 +1530,13 @@ def run_two_gpu_partition_case(output):
         report["passed"] = _two_gpu_report_passed(
             capture_results,
             source_comparison,
+            source_auxiliary_comparisons,
             source_clock_comparisons,
             replay_comparison,
             source_ownership,
+            point_source_ownership,
+            transparent_source_ownership,
+            distributed.decomposition.source_crossings,
         )
         (output / "result.json").write_text(_canonical_json(report))
         print(json.dumps({"scope": report["scope"], "passed": report["passed"]}))
@@ -1247,13 +1571,20 @@ def main():
     parser.add_argument(
         "--precision", choices=("float64", "float32"), default="float64"
     )
+    parser.add_argument(
+        "--compile-policy", choices=TWO_GPU_COMPILE_POLICIES, default="eager"
+    )
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--legacy-manifest", type=Path)
     parser.add_argument("--historical-artifact-root", type=Path)
     parser.add_argument("--compatibility-manifest", type=Path)
     args = parser.parse_args()
     if args.mode == "two-gpu":
-        return run_two_gpu_partition_case(args.output_dir)
+        return run_two_gpu_partition_case(
+            args.output_dir, compile_policy=args.compile_policy
+        )
+    if args.compile_policy != "eager":
+        parser.error("--compile-policy is supported only with --mode two-gpu")
     if args.output_dir.exists():
         parser.error("output directory must be new")
     current_manifest = torch_correctness._load_trusted_manifest()[0]

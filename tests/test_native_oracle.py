@@ -3,13 +3,13 @@ import importlib.util
 import json
 import sys
 import tempfile
-import unittest
 import zipfile
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
 import numpy as np
+import pytest
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -30,9 +30,9 @@ def load_script(name):
     return module
 
 
-class NativeOracleTest(unittest.TestCase):
+class TestNativeOracle:
     @classmethod
-    def setUpClass(cls):
+    def setup_class(cls):
         cls.oracle = load_script("native_oracle.py")
         cls.isolated = load_script("run_isolated_oracle.py")
         cls.manifest = cls.oracle.load_manifest()
@@ -209,21 +209,16 @@ class NativeOracleTest(unittest.TestCase):
 
     def test_manifest_pins_historical_reference_and_performance_records(self):
         reference = self.manifest["reference"]
-        self.assertEqual(self.manifest["schema_version"], 2)
-        self.assertEqual(reference["tag"], "native-oracle-d87d25a")
-        self.assertEqual(
-            reference["commit"], "d87d25afd160d96b1fa0890cacecd90802448d57"
+        assert (self.manifest["schema_version"]) == (2)
+        assert (reference["tag"]) == ("native-oracle-d87d25a")
+        assert (reference["commit"]) == ("d87d25afd160d96b1fa0890cacecd90802448d57")
+        assert (reference["observer_tag"]) == ("native-oracle-observer-v6")
+        assert (reference["observer_commit"]) == (
+            "2d5810cebf610fa6384235d9771f4ac699c23fc5"
         )
-        self.assertEqual(reference["observer_tag"], "native-oracle-observer-v6")
-        self.assertEqual(
-            reference["observer_commit"], "2d5810cebf610fa6384235d9771f4ac699c23fc5"
-        )
-        self.assertEqual(
-            reference["performance_observer_tag"], "native-oracle-observer-v5"
-        )
-        self.assertEqual(
-            reference["performance_summary_sha256"],
-            "1c9bdce2717ba858fd03b2e40302a5b2d19a29920496f969e33aee36e34e1baa",
+        assert (reference["performance_observer_tag"]) == ("native-oracle-observer-v5")
+        assert (reference["performance_summary_sha256"]) == (
+            "1c9bdce2717ba858fd03b2e40302a5b2d19a29920496f969e33aee36e34e1baa"
         )
 
     def test_manifest_rejects_weakened_cpu_allocation_contract(self):
@@ -232,44 +227,52 @@ class NativeOracleTest(unittest.TestCase):
             "max_full_field_or_domain_clones"
         ] = 1
         with tempfile.TemporaryDirectory() as directory:
-            with self.assertRaisesRegex(
-                ValueError, "max_full_field_or_domain_clones must be zero"
+            with pytest.raises(
+                ValueError, match="max_full_field_or_domain_clones must be zero"
             ):
                 self.oracle.load_manifest(self._write_manifest(directory, manifest))
 
-    def test_manifest_rejects_redirected_or_weakened_cpu_timing_contract(self):
+    @pytest.mark.parametrize(
+        "group_name_value_case",
+        range(4),
+        ids=("root-commit", "individual-ratio", "resamples", "regression-ratio"),
+    )
+    def test_manifest_rejects_redirected_or_weakened_cpu_timing_contract(
+        self, group_name_value_case
+    ):
         mutations = (
             ("timing_reference", "root_commit", "0" * 40),
             (None, "max_individual_ratio", 1.10),
             ("statistics", "resamples", 1),
             ("statistics", "regression_ratio", 2.0),
         )
-        for group, name, value in mutations:
-            with (
-                self.subTest(group=group, name=name),
-                tempfile.TemporaryDirectory() as directory,
-            ):
-                manifest = copy.deepcopy(self.manifest)
-                acceptance = manifest["performance_gates"]["cpu_acceptance"]
-                (acceptance if group is None else acceptance[group])[name] = value
-                with self.assertRaises(ValueError):
-                    self.oracle.load_manifest(self._write_manifest(directory, manifest))
+        group_name_value_case_values = tuple(mutations)
+        assert len(group_name_value_case_values) == 4
+        group, name, value = group_name_value_case_values[group_name_value_case]
+        with (tempfile.TemporaryDirectory() as directory,):
+            manifest = copy.deepcopy(self.manifest)
+            acceptance = manifest["performance_gates"]["cpu_acceptance"]
+            (acceptance if group is None else acceptance[group])[name] = value
+            with pytest.raises(ValueError):
+                self.oracle.load_manifest(self._write_manifest(directory, manifest))
 
-    def test_manifest_rejects_timing_runtime_identity_tampering(self):
-        for identity in (
-            None,
-            {"schema_version": 1, "torch": "2.13.0+cu126", "cuda_runtime": None},
-        ):
-            with (
-                self.subTest(identity=identity),
-                tempfile.TemporaryDirectory() as directory,
-            ):
-                manifest = copy.deepcopy(self.manifest)
-                manifest["performance_gates"]["cpu_acceptance"]["timing_reference"][
-                    "timing_runtime_identity"
-                ] = identity
-                with self.assertRaisesRegex(ValueError, "frozen baseline"):
-                    self.oracle.load_manifest(self._write_manifest(directory, manifest))
+    @pytest.mark.parametrize("identity_case", range(2), ids=("null", "cuda-build"))
+    def test_manifest_rejects_timing_runtime_identity_tampering(self, identity_case):
+        identity_case_values = tuple(
+            (
+                None,
+                {"schema_version": 1, "torch": "2.13.0+cu126", "cuda_runtime": None},
+            )
+        )
+        assert len(identity_case_values) == 2
+        identity = identity_case_values[identity_case]
+        with (tempfile.TemporaryDirectory() as directory,):
+            manifest = copy.deepcopy(self.manifest)
+            manifest["performance_gates"]["cpu_acceptance"]["timing_reference"][
+                "timing_runtime_identity"
+            ] = identity
+            with pytest.raises(ValueError, match="frozen baseline"):
+                self.oracle.load_manifest(self._write_manifest(directory, manifest))
 
     def test_manifest_rejects_noncanonical_cpu_artifact_release_url(self):
         manifest = copy.deepcopy(self.manifest)
@@ -280,7 +283,7 @@ class NativeOracleTest(unittest.TestCase):
             "torch-cpu-baseline-one.json"
         )
         with tempfile.TemporaryDirectory() as directory:
-            with self.assertRaisesRegex(ValueError, "artifact modes are invalid"):
+            with pytest.raises(ValueError, match="artifact modes are invalid"):
                 self.oracle.load_manifest(self._write_manifest(directory, manifest))
 
     def test_metadata_reader_rejects_duplicate_members_and_noncanonical_json(self):
@@ -288,13 +291,11 @@ class NativeOracleTest(unittest.TestCase):
             directory = Path(directory)
             valid = self._metadata_archive(directory, '{"schema_version": 2}')
             with np.load(valid, allow_pickle=False) as archive:
-                self.assertEqual(
-                    self.oracle.read_metadata(archive), {"schema_version": 2}
-                )
+                assert (self.oracle.read_metadata(archive)) == ({"schema_version": 2})
             duplicate = directory / "duplicate.npz"
             duplicate.write_bytes(valid.read_bytes())
             with zipfile.ZipFile(duplicate, "a") as archive:
-                with self.assertWarns(UserWarning):
+                with pytest.warns(UserWarning):
                     archive.writestr(
                         "metadata.json.npy", archive.read("metadata.json.npy")
                     )
@@ -304,10 +305,10 @@ class NativeOracleTest(unittest.TestCase):
             ):
                 path = self._metadata_archive(directory, encoded, name=f"{name}.npz")
                 with np.load(path, allow_pickle=False) as archive:
-                    with self.assertRaises(ValueError):
+                    with pytest.raises(ValueError):
                         self.oracle.read_metadata(archive)
             with np.load(duplicate, allow_pickle=False) as archive:
-                with self.assertRaisesRegex(ValueError, "exactly one metadata.json"):
+                with pytest.raises(ValueError, match="exactly one metadata.json"):
                     self.oracle.read_metadata(archive)
 
     def test_archive_contract_rejects_duplicate_members_and_schema_tampering(self):
@@ -341,22 +342,28 @@ class NativeOracleTest(unittest.TestCase):
             directory = Path(directory)
             path = self._metadata_archive(directory, json.dumps(metadata))
             with np.load(path, allow_pickle=False) as archive:
-                with self.assertRaisesRegex(
-                    ValueError, "unsupported correctness archive schema"
+                with pytest.raises(
+                    ValueError, match="unsupported correctness archive schema"
                 ):
                     self.oracle._validate_archive(archive, self.manifest, "candidate")
             duplicate = directory / "duplicate-member.npz"
             duplicate.write_bytes(path.read_bytes())
             with zipfile.ZipFile(duplicate, "a") as archive:
                 archive.writestr("unit-test-only.npy", b"not an authority artifact")
-                with self.assertWarns(UserWarning):
+                with pytest.warns(UserWarning):
                     archive.writestr("unit-test-only.npy", b"not an authority artifact")
             with np.load(duplicate, allow_pickle=False) as archive:
-                with self.assertRaisesRegex(ValueError, "array names must be unique"):
+                with pytest.raises(ValueError, match="array names must be unique"):
                     self.oracle._validate_archive(archive, self.manifest, "candidate")
 
+    @pytest.mark.parametrize(
+        "label_options_error_case",
+        range(3),
+        ids=("truncated-field", "reshaped-map", "bytecount"),
+    )
     def test_synthetic_candidate_rejects_truncation_dimension_and_bytecount_tampering(
         self,
+        label_options_error_case,
     ):
         """Exercise complete-archive checks with a temporary Torch candidate only."""
         with tempfile.TemporaryDirectory() as directory:
@@ -390,18 +397,30 @@ class NativeOracleTest(unittest.TestCase):
                     "archive_array_bytes is inaccurate",
                 ),
             )
-            for label, options, error in mutations:
-                with self.subTest(label=label):
-                    candidate = directory / f"{label}.npz"
-                    self._rewrite_archive(baseline, candidate, **options)
-                    with np.load(candidate, allow_pickle=False) as archive:
-                        with self.assertRaisesRegex(ValueError, error):
-                            self.oracle._validate_archive(
-                                archive, manifest, "candidate"
-                            )
+            label_options_error_case_values = tuple(mutations)
+            assert len(label_options_error_case_values) == 3
+            label, options, error = label_options_error_case_values[
+                label_options_error_case
+            ]
+            candidate = directory / f"{label}.npz"
+            self._rewrite_archive(baseline, candidate, **options)
+            with np.load(candidate, allow_pickle=False) as archive:
+                with pytest.raises(ValueError, match=error):
+                    self.oracle._validate_archive(archive, manifest, "candidate")
 
+    @pytest.mark.parametrize(
+        "label_arrays_validator_arguments_case",
+        range(4),
+        ids=(
+            "source-nonfinite",
+            "source-reshaped",
+            "material-nonfinite",
+            "material-reshaped",
+        ),
+    )
     def test_source_and_material_state_contracts_reject_nonfinite_and_reshaped_arrays(
         self,
+        label_arrays_validator_arguments_case,
     ):
         source_prefix = "step/1/source/Ex/0-unit-test-source"
         material_prefix = "step/1/state/Ex/0-dielectric"
@@ -413,45 +432,61 @@ class NativeOracleTest(unittest.TestCase):
             f"{material_prefix}/indices": np.zeros((1, 3), dtype=np.int64),
             f"{material_prefix}/values": np.asarray([1.0]),
         }
-        for label, arrays, validator, arguments in (
+        label_arrays_validator_arguments_case_values = tuple(
             (
-                "source-nonfinite",
-                dict(
-                    source_arrays, **{f"{source_prefix}/values": np.asarray([np.nan])}
+                (
+                    "source-nonfinite",
+                    dict(
+                        source_arrays,
+                        **{f"{source_prefix}/values": np.asarray([np.nan])},
+                    ),
+                    self.oracle._validate_source_arrays,
+                    (self._source_record(), 1),
                 ),
-                self.oracle._validate_source_arrays,
-                (self._source_record(), 1),
-            ),
-            (
-                "source-reshaped",
-                dict(source_arrays, **{f"{source_prefix}/values": np.ones((1, 1))}),
-                self.oracle._validate_source_arrays,
-                (self._source_record(), 1),
-            ),
-            (
-                "material-nonfinite",
-                dict(
-                    material_arrays,
-                    **{f"{material_prefix}/values": np.asarray([np.inf])},
+                (
+                    "source-reshaped",
+                    dict(source_arrays, **{f"{source_prefix}/values": np.ones((1, 1))}),
+                    self.oracle._validate_source_arrays,
+                    (self._source_record(), 1),
                 ),
-                self.oracle._validate_material_records,
-                ([self._material_record()], 1, "state", {"Ex": (1,)}),
-            ),
-            (
-                "material-reshaped",
-                dict(material_arrays, **{f"{material_prefix}/values": np.ones((1, 1))}),
-                self.oracle._validate_material_records,
-                ([self._material_record()], 1, "state", {"Ex": (1,)}),
-            ),
-        ):
-            with self.subTest(label=label):
-                required = set()
-                with self.assertRaisesRegex(
-                    ValueError, "(source updater state|material state)"
-                ):
-                    validator(self._arrays(**arrays), *arguments, required)
+                (
+                    "material-nonfinite",
+                    dict(
+                        material_arrays,
+                        **{f"{material_prefix}/values": np.asarray([np.inf])},
+                    ),
+                    self.oracle._validate_material_records,
+                    ([self._material_record()], 1, "state", {"Ex": (1,)}),
+                ),
+                (
+                    "material-reshaped",
+                    dict(
+                        material_arrays,
+                        **{f"{material_prefix}/values": np.ones((1, 1))},
+                    ),
+                    self.oracle._validate_material_records,
+                    ([self._material_record()], 1, "state", {"Ex": (1,)}),
+                ),
+            )
+        )
+        assert len(label_arrays_validator_arguments_case_values) == 4
+        label, arrays, validator, arguments = (
+            label_arrays_validator_arguments_case_values[
+                label_arrays_validator_arguments_case
+            ]
+        )
+        required = set()
+        with pytest.raises(ValueError, match="(source updater state|material state)"):
+            validator(self._arrays(**arrays), *arguments, required)
 
-    def test_provenance_contract_rejects_source_and_clean_state_mismatches(self):
+    @pytest.mark.parametrize(
+        "label_mutate_case",
+        range(3),
+        ids=("source-outside-checkout", "dirty-source", "reference-source"),
+    )
+    def test_provenance_contract_rejects_source_and_clean_state_mismatches(
+        self, label_mutate_case
+    ):
         source = {
             "checkout": "/tmp/unit-test-source",
             "commit": "a" * 40,
@@ -464,56 +499,71 @@ class NativeOracleTest(unittest.TestCase):
             "provenance": {"source": source, "controller": dict(source)},
             "reference_source": source["source"],
         }
-        for label, mutate in (
+        label_mutate_case_values = tuple(
             (
-                "source-outside-checkout",
-                lambda value: value.update(source="/tmp/outside.py"),
-            ),
-            (
-                "dirty-source",
-                lambda value: value.update(git_status=" M observer.py", clean=False),
-            ),
-            ("reference-source", lambda value: None),
-        ):
-            with self.subTest(label=label):
-                candidate = copy.deepcopy(metadata)
-                if label == "reference-source":
-                    candidate["reference_source"] = "/tmp/different.py"
-                else:
-                    mutate(candidate["provenance"]["source"])
-                with self.assertRaises(ValueError):
-                    self.oracle._validate_archive_provenance(
-                        candidate, self.manifest, "candidate"
-                    )
+                (
+                    "source-outside-checkout",
+                    lambda value: value.update(source="/tmp/outside.py"),
+                ),
+                (
+                    "dirty-source",
+                    lambda value: value.update(
+                        git_status=" M observer.py", clean=False
+                    ),
+                ),
+                ("reference-source", lambda value: None),
+            )
+        )
+        assert len(label_mutate_case_values) == 3
+        label, mutate = label_mutate_case_values[label_mutate_case]
+        candidate = copy.deepcopy(metadata)
+        if label == "reference-source":
+            candidate["reference_source"] = "/tmp/different.py"
+        else:
+            mutate(candidate["provenance"]["source"])
+        with pytest.raises(ValueError):
+            self.oracle._validate_archive_provenance(
+                candidate, self.manifest, "candidate"
+            )
 
     def test_retained_readers_and_validators_remain_available(self):
         case = self.oracle.find_case(self.manifest, "drude-1")
-        self.assertEqual(case["name"], "drude-1")
-        self.assertEqual(
+        assert (case["name"]) == ("drude-1")
+        assert (
             self.oracle.tolerance_for_key(
                 self.manifest, "torch", "step/1/material/drude/state", "float32"
-            ),
-            self.manifest["tolerances"]["torch"]["drude"]["float32"],
-        )
-        with self.assertRaises(ValueError):
+            )
+        ) == (self.manifest["tolerances"]["torch"]["drude"]["float32"])
+        with pytest.raises(ValueError):
             self.oracle.find_case(self.manifest, "not-a-workload")
 
-    def test_candidate_checkout_rejects_native_execution(self):
+    @pytest.mark.parametrize(
+        "operation_arguments_case", range(3), ids=("build", "capture", "benchmark")
+    )
+    def test_candidate_checkout_rejects_native_execution(
+        self, operation_arguments_case
+    ):
         case = self.oracle.find_case(self.manifest, "drude-1")
-        for operation, arguments in (
-            (self.oracle.build_simulation, (case, object())),
-            (self.oracle.capture_case, (case, self.manifest, Path("reference.npz"))),
-            (self.oracle.benchmark_case, (case, self.manifest, 1, 0, 1)),
-        ):
-            with self.subTest(operation=operation.__name__):
-                with self.assertRaisesRegex(RuntimeError, "retired"):
-                    operation(*arguments)
+        operation_arguments_case_values = tuple(
+            (
+                (self.oracle.build_simulation, (case, object())),
+                (
+                    self.oracle.capture_case,
+                    (case, self.manifest, Path("reference.npz")),
+                ),
+                (self.oracle.benchmark_case, (case, self.manifest, 1, 0, 1)),
+            )
+        )
+        assert len(operation_arguments_case_values) == 3
+        operation, arguments = operation_arguments_case_values[operation_arguments_case]
+        with pytest.raises(RuntimeError, match="retired"):
+            operation(*arguments)
 
     def test_cli_only_exposes_reader_and_comparator_operations(self):
         with patch.object(sys, "argv", ["native_oracle.py", "--help"]):
-            with self.assertRaises(SystemExit) as result:
+            with pytest.raises(SystemExit) as result:
                 self.oracle.main()
-        self.assertEqual(result.exception.code, 0)
+        assert (result.value.code) == (0)
 
     def test_isolated_capture_requires_the_pinned_observer_checkout(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -526,7 +576,7 @@ class NativeOracleTest(unittest.TestCase):
                 "run",
                 return_value=SimpleNamespace(stdout="wrong-commit\n"),
             ):
-                with self.assertRaisesRegex(ValueError, "pinned observer commit"):
+                with pytest.raises(ValueError, match="pinned observer commit"):
                     self.isolated.run_capture(
                         checkout,
                         Path(sys.executable),
@@ -557,15 +607,14 @@ class NativeOracleTest(unittest.TestCase):
                     "drude-1",
                     Path(directory) / "reference.npz",
                 )
-            self.assertEqual(result["historical_observer_commit"], expected)
-            self.assertEqual(result["command"][2], str(runner.resolve()))
-            self.assertEqual(run.call_count, 2)
+            assert (result["historical_observer_commit"]) == (expected)
+            assert (result["command"][2]) == (str(runner.resolve()))
+            assert (run.call_count) == (2)
             commit_call, capture_call = run.call_args_list
-            self.assertEqual(
-                commit_call.args[0],
-                ["git", "-C", str(checkout.resolve()), "rev-parse", "HEAD"],
+            assert (commit_call.args[0]) == (
+                ["git", "-C", str(checkout.resolve()), "rev-parse", "HEAD"]
             )
-            self.assertEqual(capture_call.args[0], result["command"])
+            assert (capture_call.args[0]) == (result["command"])
 
     def test_isolated_environment_excludes_controller_import_paths(self):
         with patch.dict(
@@ -574,11 +623,7 @@ class NativeOracleTest(unittest.TestCase):
             clear=False,
         ):
             environment = self.isolated.sanitized_environment()
-        self.assertNotIn("PYTHONPATH", environment)
-        self.assertNotIn("PYTHONHOME", environment)
-        self.assertNotIn("VIRTUAL_ENV", environment)
-        self.assertEqual(environment["PYTHONNOUSERSITE"], "1")
-
-
-if __name__ == "__main__":
-    unittest.main()
+        assert ("PYTHONPATH") not in (environment)
+        assert ("PYTHONHOME") not in (environment)
+        assert ("VIRTUAL_ENV") not in (environment)
+        assert (environment["PYTHONNOUSERSITE"]) == ("1")

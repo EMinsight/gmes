@@ -5,9 +5,10 @@ import json
 import math
 import platform
 import tempfile
-import unittest
 from pathlib import Path
 from statistics import median, pstdev
+
+import pytest
 
 ROOT = Path(__file__).resolve().parents[1]
 MANIFEST = ROOT / "benchmarks" / "native_oracle_workloads.json"
@@ -21,9 +22,9 @@ def load_script(name):
     return module
 
 
-class NativeSummaryTest(unittest.TestCase):
+class TestNativeSummary:
     @classmethod
-    def setUpClass(cls):
+    def setup_class(cls):
         cls.summary = load_script("native_summary.py")
         cls.tuning = load_script("torch_tuning.py")
         cls.manifest = json.loads(MANIFEST.read_text())
@@ -246,35 +247,34 @@ class NativeSummaryTest(unittest.TestCase):
             forward = self.summary.assemble_summary(paths, MANIFEST)
             reverse = self.summary.assemble_summary(reversed(paths), MANIFEST)
 
-        self.assertEqual(forward, reverse)
-        self.assertEqual(
-            self.summary.render_summary(forward),
-            self.summary.render_summary(reverse),
+        assert (forward) == (reverse)
+        assert (self.summary.render_summary(forward)) == (
+            self.summary.render_summary(reverse)
         )
-        self.assertEqual(forward["schema_version"], 3)
-        self.assertEqual(forward["kind"], "native-cpu-acceptance-summary")
-        self.assertEqual(
-            forward["observer_commit"], self.reference["performance_observer_commit"]
+        assert (forward["schema_version"]) == (3)
+        assert (forward["kind"]) == ("native-cpu-acceptance-summary")
+        assert (forward["observer_commit"]) == (
+            self.reference["performance_observer_commit"]
         )
-        self.assertEqual(forward["benchmark_contract"], self.contract)
-        self.assertEqual(len(forward["samples"]), 12)
-        self.assertEqual(
+        assert (forward["benchmark_contract"]) == (self.contract)
+        assert (len(forward["samples"])) == (12)
+        assert (
             [
                 (sample["workload"]["name"], sample["openmp_threads"])
                 for sample in forward["samples"]
-            ],
-            [(name, threads) for name in self.summary.CASE_NAMES for threads in (1, 4)],
+            ]
+        ) == (
+            [(name, threads) for name in self.summary.CASE_NAMES for threads in (1, 4)]
         )
-        self.assertNotIn("openmp_threads", forward["environment"])
-        self.assertNotIn("omp_num_threads", forward["environment"])
-        self.assertNotIn("CPU(s) scaling MHz:", forward["environment"]["cpu_model"])
+        assert ("openmp_threads") not in (forward["environment"])
+        assert ("omp_num_threads") not in (forward["environment"])
+        assert ("CPU(s) scaling MHz:") not in (forward["environment"]["cpu_model"])
         for source in forward["source_artifacts"]:
             key = (source["workload"], source["threads"])
-            self.assertEqual(source["sha256"], expected_sha[key])
-            self.assertIn("CPU(s) scaling MHz:", source["raw_environment"]["cpu_model"])
-            self.assertEqual(
-                source["raw_environment"]["omp_num_threads"],
-                str(source["threads"]),
+            assert (source["sha256"]) == (expected_sha[key])
+            assert ("CPU(s) scaling MHz:") in (source["raw_environment"]["cpu_model"])
+            assert (source["raw_environment"]["omp_num_threads"]) == (
+                str(source["threads"])
             )
 
     def test_cli_writes_canonical_output(self):
@@ -293,8 +293,8 @@ class NativeSummaryTest(unittest.TestCase):
             expected = self.summary.render_summary(
                 self.summary.assemble_summary(paths, MANIFEST)
             )
-            self.assertEqual(output.read_text(), expected)
-            self.assertTrue(output.read_bytes().endswith(b"\n"))
+            assert (output.read_text()) == (expected)
+            assert output.read_bytes().endswith(b"\n")
 
     def test_assembled_summary_is_consumed_by_native_gate(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -341,19 +341,24 @@ class NativeSummaryTest(unittest.TestCase):
             result = self.tuning._native_gate(
                 output, spec["name"], 1, candidate, manifest
             )
-        self.assertTrue(result["comparison_valid"], result["contract_errors"])
-        self.assertEqual(result["comparison_role"], "informational")
+        assert result["comparison_valid"]
+        assert (result["comparison_role"]) == ("informational")
 
     def test_rejects_missing_and_duplicate_cells(self):
         with tempfile.TemporaryDirectory() as directory:
             paths = self._write_inputs(directory)
-            with self.assertRaisesRegex(ValueError, "exactly twelve"):
+            with pytest.raises(ValueError, match="exactly twelve"):
                 self.summary.assemble_summary(paths[:-1], MANIFEST)
             duplicate = [*paths[:-1], paths[0]]
-            with self.assertRaisesRegex(ValueError, "duplicate"):
+            with pytest.raises(ValueError, match="duplicate"):
                 self.summary.assemble_summary(duplicate, MANIFEST)
 
-    def test_rejects_cell_schema_workload_and_contract_changes(self):
+    @pytest.mark.parametrize(
+        "suffix_mutation_case", range(3), ids=("schema", "workload", "contract")
+    )
+    def test_rejects_cell_schema_workload_and_contract_changes(
+        self, suffix_mutation_case
+    ):
         mutations = {
             "schema": lambda cell: cell.__setitem__("schema_version", 1),
             "workload": lambda cell: cell["workload"].__setitem__("size", [1]),
@@ -363,16 +368,18 @@ class NativeSummaryTest(unittest.TestCase):
         }
         with tempfile.TemporaryDirectory() as directory:
             original = self._write_inputs(directory)
-            for suffix, mutation in mutations.items():
-                with self.subTest(suffix=suffix):
-                    paths = list(original)
-                    paths[0] = self._mutated_input(
-                        directory, original[0], mutation, suffix
-                    )
-                    with self.assertRaises(ValueError):
-                        self.summary.assemble_summary(paths, MANIFEST)
+            suffix_mutation_case_values = tuple(mutations.items())
+            assert len(suffix_mutation_case_values) == 3
+            suffix, mutation = suffix_mutation_case_values[suffix_mutation_case]
+            paths = list(original)
+            paths[0] = self._mutated_input(directory, original[0], mutation, suffix)
+            with pytest.raises(ValueError):
+                self.summary.assemble_summary(paths, MANIFEST)
 
-    def test_rejects_wrong_or_dirty_observer_checkout(self):
+    @pytest.mark.parametrize(
+        "suffix_mutation_case", range(2), ids=("wrong-commit", "dirty")
+    )
+    def test_rejects_wrong_or_dirty_observer_checkout(self, suffix_mutation_case):
         mutations = {
             "wrong-commit": lambda cell: cell["environment"].__setitem__(
                 "git_commit", "0" * 40
@@ -383,16 +390,16 @@ class NativeSummaryTest(unittest.TestCase):
         }
         with tempfile.TemporaryDirectory() as directory:
             original = self._write_inputs(directory)
-            for suffix, mutation in mutations.items():
-                with self.subTest(suffix=suffix):
-                    paths = list(original)
-                    paths[0] = self._mutated_input(
-                        directory, original[0], mutation, suffix
-                    )
-                    with self.assertRaisesRegex(ValueError, "observer commit|dirty"):
-                        self.summary.assemble_summary(paths, MANIFEST)
+            suffix_mutation_case_values = tuple(mutations.items())
+            assert len(suffix_mutation_case_values) == 2
+            suffix, mutation = suffix_mutation_case_values[suffix_mutation_case]
+            paths = list(original)
+            paths[0] = self._mutated_input(directory, original[0], mutation, suffix)
+            with pytest.raises(ValueError, match="observer commit|dirty"):
+                self.summary.assemble_summary(paths, MANIFEST)
 
-    def test_rejects_invalid_threads_and_mixed_environments(self):
+    @pytest.mark.parametrize("suffix_mutation_case", range(2), ids=("thread", "host"))
+    def test_rejects_invalid_threads_and_mixed_environments(self, suffix_mutation_case):
         mutations = {
             "thread": lambda cell: (
                 cell["environment"].__setitem__("openmp_threads", 2),
@@ -404,16 +411,13 @@ class NativeSummaryTest(unittest.TestCase):
         }
         with tempfile.TemporaryDirectory() as directory:
             original = self._write_inputs(directory)
-            for suffix, mutation in mutations.items():
-                with self.subTest(suffix=suffix):
-                    paths = list(original)
-                    paths[0] = self._mutated_input(
-                        directory, original[0], mutation, suffix
-                    )
-                    with self.assertRaisesRegex(
-                        ValueError, "thread count|one environment"
-                    ):
-                        self.summary.assemble_summary(paths, MANIFEST)
+            suffix_mutation_case_values = tuple(mutations.items())
+            assert len(suffix_mutation_case_values) == 2
+            suffix, mutation = suffix_mutation_case_values[suffix_mutation_case]
+            paths = list(original)
+            paths[0] = self._mutated_input(directory, original[0], mutation, suffix)
+            with pytest.raises(ValueError, match="thread count|one environment"):
+                self.summary.assemble_summary(paths, MANIFEST)
 
     def test_rejects_physical_threads_that_differ_from_baseline_pin(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -429,7 +433,7 @@ class NativeSummaryTest(unittest.TestCase):
                 path = Path(directory) / f"eight-core-{index}.json"
                 path.write_text(json.dumps(cell, indent=2, sort_keys=True) + "\n")
                 paths.append(path)
-            with self.assertRaisesRegex(ValueError, "frozen artifact pin"):
+            with pytest.raises(ValueError, match="frozen artifact pin"):
                 self.summary.assemble_summary(paths, MANIFEST)
 
     def test_rejects_unstable_native_advance_samples(self):
@@ -452,7 +456,7 @@ class NativeSummaryTest(unittest.TestCase):
             paths[0] = self._mutated_input(
                 directory, original[0], make_unstable, "unstable"
             )
-            with self.assertRaisesRegex(ValueError, "relative-MAD limit"):
+            with pytest.raises(ValueError, match="relative-MAD limit"):
                 self.summary.assemble_summary(paths, MANIFEST)
 
     def test_rejects_unfrozen_relative_mad_manifest(self):
@@ -465,10 +469,15 @@ class NativeSummaryTest(unittest.TestCase):
             ] = 0.99
             manifest_path = directory / "weakened-manifest.json"
             manifest_path.write_text(json.dumps(manifest))
-            with self.assertRaisesRegex(ValueError, "not frozen"):
+            with pytest.raises(ValueError, match="not frozen"):
                 self.summary.assemble_summary(paths, manifest_path)
 
-    def test_rejects_inconsistent_native_accounting(self):
+    @pytest.mark.parametrize(
+        "suffix_mutation_case",
+        range(3),
+        ids=("rss-peak", "updater-bytes", "throughput"),
+    )
+    def test_rejects_inconsistent_native_accounting(self, suffix_mutation_case):
         mutations = {
             "rss-peak": lambda cell: cell["memory"].__setitem__("peak_rss_bytes", 1),
             "updater-bytes": lambda cell: cell["updaters"][0].__setitem__(
@@ -480,16 +489,13 @@ class NativeSummaryTest(unittest.TestCase):
         }
         with tempfile.TemporaryDirectory() as directory:
             original = self._write_inputs(directory)
-            for suffix, mutation in mutations.items():
-                with self.subTest(suffix=suffix):
-                    paths = list(original)
-                    paths[0] = self._mutated_input(
-                        directory, original[0], mutation, suffix
-                    )
-                    with self.assertRaisesRegex(
-                        ValueError, "RSS|updater|timing contract"
-                    ):
-                        self.summary.assemble_summary(paths, MANIFEST)
+            suffix_mutation_case_values = tuple(mutations.items())
+            assert len(suffix_mutation_case_values) == 3
+            suffix, mutation = suffix_mutation_case_values[suffix_mutation_case]
+            paths = list(original)
+            paths[0] = self._mutated_input(directory, original[0], mutation, suffix)
+            with pytest.raises(ValueError, match="RSS|updater|timing contract"):
+                self.summary.assemble_summary(paths, MANIFEST)
 
     def test_rejects_signed_zero_environment_ambiguity(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -501,7 +507,7 @@ class NativeSummaryTest(unittest.TestCase):
                 lambda cell: cell["environment"].__setitem__("memory_bytes", -0.0),
                 "negative-zero",
             )
-            with self.assertRaisesRegex(ValueError, "environment identity"):
+            with pytest.raises(ValueError, match="environment identity"):
                 self.summary.assemble_summary(paths, MANIFEST)
 
     def test_rejects_ansi_instead_of_sanitizing_it(self):
@@ -516,7 +522,7 @@ class NativeSummaryTest(unittest.TestCase):
                 ),
                 "ansi",
             )
-            with self.assertRaisesRegex(ValueError, "ANSI"):
+            with pytest.raises(ValueError, match="ANSI"):
                 self.summary.assemble_summary(paths, MANIFEST)
 
     def test_normalizes_only_balanced_gpu_topology_underline_sgr(self):
@@ -528,37 +534,46 @@ class NativeSummaryTest(unittest.TestCase):
             source_sha256 = hashlib.sha256(paths[0].read_bytes()).hexdigest()
             summary = self.summary.assemble_summary(paths, MANIFEST)
 
-        self.assertEqual(summary["environment"]["gpu_topology"], "GPU0 GPU-0000")
+        assert (summary["environment"]["gpu_topology"]) == ("GPU0 GPU-0000")
         provenance = summary["source_artifacts"][0]["normalization_provenance"]
-        self.assertEqual(
-            provenance,
+        assert (provenance) == (
             {
                 "rule_id": "nvidia-smi-topology-underline-sgr-v1",
                 "json_pointer": "/environment/gpu_topology",
                 "source_sha256": source_sha256,
                 "applied": True,
                 "removed_pair_count": 1,
-            },
+            }
         )
 
-    def test_rejects_unpaired_nested_and_other_gpu_topology_controls(self):
+    @pytest.mark.parametrize(
+        "suffix_topology_case",
+        range(4),
+        ids=(
+            "unpaired-reset",
+            "unterminated-underline",
+            "nested-underline",
+            "other-control",
+        ),
+    )
+    def test_rejects_unpaired_nested_and_other_gpu_topology_controls(
+        self, suffix_topology_case
+    ):
         invalid = {
             "unpaired-reset": "\x1b[0mGPU0 GPU-0000",
             "unterminated-underline": "\x1b[4mGPU0 GPU-0000",
             "nested-underline": "\x1b[4mGPU\x1b[4m0\x1b[0m\x1b[0m GPU-0000",
             "other-control": "GPU0\x07 GPU-0000",
         }
-        for suffix, topology in invalid.items():
-            with (
-                self.subTest(suffix=suffix),
-                tempfile.TemporaryDirectory() as directory,
+        suffix_topology_case_values = tuple(invalid.items())
+        assert len(suffix_topology_case_values) == 4
+        suffix, topology = suffix_topology_case_values[suffix_topology_case]
+        with (tempfile.TemporaryDirectory() as directory,):
+            paths = self._write_gpu_topology_inputs(directory, topology)
+            with pytest.raises(
+                ValueError, match="unpaired|unterminated|nested|control"
             ):
-                paths = self._write_gpu_topology_inputs(directory, topology)
-                with self.assertRaisesRegex(
-                    ValueError,
-                    "unpaired|unterminated|nested|control",
-                ):
-                    self.summary.assemble_summary(paths, MANIFEST)
+                self.summary.assemble_summary(paths, MANIFEST)
 
     def test_rejects_duplicate_json_keys_and_inconsistent_raw_statistics(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -567,7 +582,7 @@ class NativeSummaryTest(unittest.TestCase):
             duplicate_key.write_text('{"schema_version": 2, "schema_version": 2}\n')
             paths = list(original)
             paths[0] = duplicate_key
-            with self.assertRaisesRegex(ValueError, "duplicate JSON key"):
+            with pytest.raises(ValueError, match="duplicate JSON key"):
                 self.summary.assemble_summary(paths, MANIFEST)
 
             paths = list(original)
@@ -579,10 +594,13 @@ class NativeSummaryTest(unittest.TestCase):
                 ),
                 "statistics",
             )
-            with self.assertRaisesRegex(ValueError, "non-finite JSON constant"):
+            with pytest.raises(ValueError, match="non-finite JSON constant"):
                 self.summary.assemble_summary(paths, MANIFEST)
 
-    def test_rejects_ansi_keys_and_boolean_transfer_samples(self):
+    @pytest.mark.parametrize(
+        "suffix_mutation_case", range(2), ids=("ansi-key", "boolean-transfer")
+    )
+    def test_rejects_ansi_keys_and_boolean_transfer_samples(self, suffix_mutation_case):
         mutations = {
             "ansi-key": lambda cell: cell["updaters"][0].__setitem__(
                 "\x1b[31mcells", 10
@@ -593,15 +611,10 @@ class NativeSummaryTest(unittest.TestCase):
         }
         with tempfile.TemporaryDirectory() as directory:
             original = self._write_inputs(directory)
-            for suffix, mutation in mutations.items():
-                with self.subTest(suffix=suffix):
-                    paths = list(original)
-                    paths[0] = self._mutated_input(
-                        directory, original[0], mutation, suffix
-                    )
-                    with self.assertRaisesRegex(ValueError, "ANSI|transfer"):
-                        self.summary.assemble_summary(paths, MANIFEST)
-
-
-if __name__ == "__main__":
-    unittest.main()
+            suffix_mutation_case_values = tuple(mutations.items())
+            assert len(suffix_mutation_case_values) == 2
+            suffix, mutation = suffix_mutation_case_values[suffix_mutation_case]
+            paths = list(original)
+            paths[0] = self._mutated_input(directory, original[0], mutation, suffix)
+            with pytest.raises(ValueError, match="ANSI|transfer"):
+                self.summary.assemble_summary(paths, MANIFEST)

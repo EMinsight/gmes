@@ -6,6 +6,7 @@ import io
 import json
 import math
 import os
+import re
 import shutil
 import stat
 import struct
@@ -14,13 +15,14 @@ import tempfile
 import time
 import traceback
 import unicodedata
-import unittest
 import zipfile
 import zlib
+from contextlib import contextmanager
 from pathlib import Path
 from unittest import mock
 
 import numpy as np
+import pytest
 
 from benchmarks import issue123_completion as completion
 from benchmarks import issue123_privacy as privacy
@@ -64,10 +66,10 @@ def _exception_messages(error):
     return messages
 
 
-def _assert_sanitized_privacy_error(testcase, error, marker):
-    testcase.assertIs(type(error), privacy.PrivacyError)
-    testcase.assertIsNone(error.__cause__)
-    testcase.assertIsNone(error.__context__)
+def _assert_sanitized_privacy_error(error, marker):
+    assert type(error) is privacy.PrivacyError
+    assert error.__cause__ is None
+    assert error.__context__ is None
     pending = [error]
     seen = set()
     diagnostics = [
@@ -95,7 +97,7 @@ def _assert_sanitized_privacy_error(testcase, error, marker):
             )
             if item is not None
         )
-    testcase.assertNotIn(marker, " ".join(diagnostics))
+    assert marker not in " ".join(diagnostics)
 
 
 def _trace_events():
@@ -812,8 +814,8 @@ def _gzip_bytes(raw):
     return compressor.compress(raw) + compressor.flush()
 
 
-class Issue123PrivacyProjectionTest(unittest.TestCase):
-    def setUp(self):
+class _Issue123PrivacyFixture:
+    def initialize(self):
         self.policy, self.private = _fixture()
         self.salt = bytes(range(32))
         self._production_project_publication = privacy.project_publication
@@ -837,8 +839,7 @@ class Issue123PrivacyProjectionTest(unittest.TestCase):
         project_patcher = mock.patch.object(
             privacy, "project_publication", new=deterministic_project_publication
         )
-        project_patcher.start()
-        self.addCleanup(project_patcher.stop)
+        self.project_patcher = project_patcher
 
     def project(self, *, openings=None):
         return privacy.project_publication(
@@ -847,6 +848,13 @@ class Issue123PrivacyProjectionTest(unittest.TestCase):
             salt=self.salt,
             private_openings=openings,
         )
+
+
+class TestIssue123PrivacyProjection(_Issue123PrivacyFixture):
+    @pytest.fixture(autouse=True)
+    def _initialize_fixture(self):
+        with issue123_privacy_fixture(self):
+            yield
 
     def test_synthetic_literal_binding_scaffold_is_deterministic_and_private(self):
         with tempfile.TemporaryDirectory() as name:
@@ -900,10 +908,9 @@ class Issue123PrivacyProjectionTest(unittest.TestCase):
                 specification,
                 runtime_receipt_paths=runtime_paths,
             )
-            self.assertEqual(
-                [scope["name"] for scope in materialized.private_bundle["scopes"]],
-                list(privacy.TECHNICAL_SCOPE_ORDER),
-            )
+            assert [
+                scope["name"] for scope in materialized.private_bundle["scopes"]
+            ] == list(privacy.TECHNICAL_SCOPE_ORDER)
             first_openings = privacy.PrivateOpenings(self.salt)
             second_openings = privacy.PrivateOpenings(self.salt)
             first = privacy.project_publication(
@@ -916,7 +923,7 @@ class Issue123PrivacyProjectionTest(unittest.TestCase):
                 adapter_policy,
                 private_openings=second_openings,
             )
-            self.assertEqual(first, second)
+            assert first == second
             ledger = [
                 {
                     "role": "technical_evidence",
@@ -931,9 +938,9 @@ class Issue123PrivacyProjectionTest(unittest.TestCase):
                 ledger,
             )
             protected = privacy.serialize_private_openings(first_openings, context)
-            self.assertNotIn(b"source_path", protected)
-            self.assertNotIn(b"private-host", protected)
-            self.assertNotIn(struct.pack("<2d", 1.0, 2.0), protected)
+            assert b"source_path" not in protected
+            assert b"private-host" not in protected
+            assert struct.pack("<2d", 1.0, 2.0) not in protected
             private_directory = root / "authority"
             private_directory.mkdir(mode=0o700)
             protected_path = private_directory / "openings.json"
@@ -943,15 +950,15 @@ class Issue123PrivacyProjectionTest(unittest.TestCase):
                 protected_path,
                 context,
             )
-            self.assertEqual(loaded_context, context)
-            self.assertEqual(stat.S_IMODE(protected_path.stat().st_mode), 0o600)
-            self.assertEqual(stat.S_IMODE(private_directory.stat().st_mode), 0o700)
+            assert loaded_context == context
+            assert stat.S_IMODE(protected_path.stat().st_mode) == 384
+            assert stat.S_IMODE(private_directory.stat().st_mode) == 448
 
             legacy = copy.deepcopy(specification_document)
             legacy["schema_version"] = 0
             legacy_path = root / "legacy-source-spec.json"
             legacy_path.write_bytes(privacy.binding_canonical_json_bytes(legacy))
-            with self.assertRaisesRegex(privacy.PrivacyError, "identity"):
+            with pytest.raises(privacy.PrivacyError, match="identity"):
                 privacy.load_publication_source_spec(
                     legacy_path,
                     adapter_policy,
@@ -960,7 +967,7 @@ class Issue123PrivacyProjectionTest(unittest.TestCase):
 
             first_source = root / specification_document["sources"][0]["source_path"]
             first_source.write_bytes(first_source.read_bytes() + b" ")
-            with self.assertRaisesRegex(privacy.PrivacyError, "bytes differ"):
+            with pytest.raises(privacy.PrivacyError, match="bytes differ"):
                 privacy.materialize_publication_inputs(
                     specification,
                     runtime_receipt_paths=runtime_paths,
@@ -968,11 +975,11 @@ class Issue123PrivacyProjectionTest(unittest.TestCase):
 
             substituted = json.loads(protected)
             substituted["binding"]["value"] = "0" * 64
-            with self.assertRaisesRegex(privacy.PrivacyError, "authentication"):
+            with pytest.raises(privacy.PrivacyError, match="authentication"):
                 privacy.load_private_openings(
                     privacy.binding_canonical_json_bytes(substituted)
                 )
-            with self.assertRaisesRegex(privacy.PrivacyError, "unavailable"):
+            with pytest.raises(privacy.PrivacyError, match="unavailable"):
                 privacy.load_private_openings(private_directory / "missing.json")
 
     def test_production_binding_profile_is_fail_closed_until_owner_profile_exists(
@@ -997,10 +1004,9 @@ class Issue123PrivacyProjectionTest(unittest.TestCase):
                 root,
                 document,
             )
-            self.assertEqual(dict(privacy.CODE_OWNED_LITERAL_TARGET_BINDINGS), {})
-            with self.assertRaisesRegex(
-                privacy.PrivacyError,
-                "no code-owned evaluator binding",
+            assert dict(privacy.CODE_OWNED_LITERAL_TARGET_BINDINGS) == {}
+            with pytest.raises(
+                privacy.PrivacyError, match="no code-owned evaluator binding"
             ):
                 privacy.load_publication_source_spec(
                     specification_path,
@@ -1011,7 +1017,14 @@ class Issue123PrivacyProjectionTest(unittest.TestCase):
                     ).hexdigest(),
                 )
 
-    def test_synthetic_binding_scaffold_rejects_same_scope_decoy_rebuild(self):
+    @pytest.mark.parametrize(
+        "attack_ordinal_attack_role_case",
+        range(2),
+        ids=("same-scope-decoy", "cuda-candidate"),
+    )
+    def test_synthetic_binding_scaffold_rejects_same_scope_decoy_rebuild(
+        self, attack_ordinal_attack_role_case
+    ):
         with tempfile.TemporaryDirectory() as name:
             root = Path(name)
             policy = copy.deepcopy(self.policy)
@@ -1032,10 +1045,10 @@ class Issue123PrivacyProjectionTest(unittest.TestCase):
                 if record["scope"] == "cpu"
                 and record["semantic_role"].startswith("correctness-")
             ]
-            self.assertEqual(
-                [record["semantic_role"] for record in correctness_records],
-                ["correctness-reference", "correctness-candidate"],
-            )
+            assert [record["semantic_role"] for record in correctness_records] == [
+                "correctness-reference",
+                "correctness-candidate",
+            ]
             reference_record, candidate_record = correctness_records
 
             def record_descriptor(record):
@@ -1271,11 +1284,8 @@ class Issue123PrivacyProjectionTest(unittest.TestCase):
                     "cuda_suite_gate/correctness_indexes/1/source_artifact/"
                     "@document/artifacts/0/reference",
                 )
-                self.assertTrue(
-                    all(
-                        catalog[role] == catalog[shared_roles[0]]
-                        for role in shared_roles
-                    )
+                assert all(
+                    (catalog[role] == catalog[shared_roles[0]] for role in shared_roles)
                 )
 
                 def structurally_valid_b1(
@@ -1313,7 +1323,7 @@ class Issue123PrivacyProjectionTest(unittest.TestCase):
                         runtime_receipt_paths=runtime_paths,
                         manifest_path=root / "synthetic-manifest.json",
                     )
-                self.assertTrue(verified["first_five_scopes_validated"])
+                assert verified["first_five_scopes_validated"]
 
                 attack_roles = (
                     "/artifacts/cpu/same_scope_decoy",
@@ -1324,104 +1334,116 @@ class Issue123PrivacyProjectionTest(unittest.TestCase):
                 decoy_candidate_bytes = np.asarray(
                     [1.0 + 2e-10, 2.0], dtype="<f8"
                 ).tobytes()
-                for attack_ordinal, attack_role in enumerate(attack_roles):
-                    attack_descriptor = catalog[attack_role]
-                    attack_inventory = copy.deepcopy(materialized.technical_inventory)
-                    attack_record = next(
-                        item
-                        for item in attack_inventory["sources"]
-                        if item["scope"] == "cpu"
-                        and item["semantic_role"] == "correctness-candidate"
+                attack_ordinal_attack_role_case_values = tuple(enumerate(attack_roles))
+                assert len(attack_ordinal_attack_role_case_values) == 2
+                attack_ordinal, attack_role = attack_ordinal_attack_role_case_values[
+                    attack_ordinal_attack_role_case
+                ]
+                attack_descriptor = catalog[attack_role]
+                attack_inventory = copy.deepcopy(materialized.technical_inventory)
+                attack_record = next(
+                    item
+                    for item in attack_inventory["sources"]
+                    if item["scope"] == "cpu"
+                    and item["semantic_role"] == "correctness-candidate"
+                )
+                attack_record.update(
+                    completion_role=attack_role,
+                    bundle_path=attack_descriptor["path"],
+                    sha256=attack_descriptor["sha256"],
+                    size_bytes=attack_descriptor["size_bytes"],
+                    media_type=attack_descriptor["media_type"],
+                )
+                attack_private = copy.deepcopy(materialized.private_bundle)
+                attack_private["scopes"][0]["correctness"][0]["captures"][0]["arrays"][
+                    0
+                ]["candidate_bytes"] = decoy_candidate_bytes
+                attack_materialized = privacy.MaterializedPublicationInputs(
+                    private_bundle=attack_private,
+                    technical_inventory=attack_inventory,
+                    technical_input_root=privacy.tagged_canonical_sha256(
+                        privacy.TECHNICAL_INPUT_INVENTORY_DOMAIN,
+                        attack_inventory,
+                    ),
+                    source_specification_sha256=hashlib.sha256(
+                        privacy.binding_canonical_json_bytes(attack_inventory)
+                    ).hexdigest(),
+                )
+                attack_openings = privacy.PrivateOpenings(bytes(range(32)))
+                attack_projection = privacy.project_publication(
+                    attack_private,
+                    policy,
+                    private_openings=attack_openings,
+                )
+                attack_assets, attack_ledger = public_outputs(attack_projection)
+                attack_context = privacy.publication_binding_context(
+                    attack_materialized,
+                    attack_projection,
+                    attack_ledger,
+                )
+                attack_openings_path = (
+                    authority / f"attack-{attack_ordinal}-openings.json"
+                )
+                privacy.write_private_authority_file(
+                    attack_openings_path,
+                    privacy.serialize_private_openings(
+                        attack_openings,
+                        attack_context,
+                    ),
+                    label="synthetic attack openings",
+                )
+                with (
+                    mock.patch.object(
+                        completion,
+                        "evaluate_completion",
+                        side_effect=structurally_valid_b1,
+                    ),
+                    pytest.raises(
+                        privacy.PrivacyError,
+                        match="publication source evaluator role assertion differs",
+                    ),
+                ):
+                    privacy.verify_publication_bundle_binding(
+                        index_path=completion_index,
+                        protected_openings=attack_openings_path,
+                        policy=policy,
+                        public_assets=attack_assets,
+                        runtime_receipt_paths=runtime_paths,
+                        manifest_path=root / "synthetic-manifest.json",
                     )
-                    attack_record.update(
-                        completion_role=attack_role,
-                        bundle_path=attack_descriptor["path"],
-                        sha256=attack_descriptor["sha256"],
-                        size_bytes=attack_descriptor["size_bytes"],
-                        media_type=attack_descriptor["media_type"],
-                    )
-                    attack_private = copy.deepcopy(materialized.private_bundle)
-                    attack_private["scopes"][0]["correctness"][0]["captures"][0][
-                        "arrays"
-                    ][0]["candidate_bytes"] = decoy_candidate_bytes
-                    attack_materialized = privacy.MaterializedPublicationInputs(
-                        private_bundle=attack_private,
-                        technical_inventory=attack_inventory,
-                        technical_input_root=privacy.tagged_canonical_sha256(
-                            privacy.TECHNICAL_INPUT_INVENTORY_DOMAIN,
-                            attack_inventory,
-                        ),
-                        source_specification_sha256=hashlib.sha256(
-                            privacy.binding_canonical_json_bytes(attack_inventory)
-                        ).hexdigest(),
-                    )
-                    attack_openings = privacy.PrivateOpenings(bytes(range(32)))
-                    attack_projection = privacy.project_publication(
-                        attack_private,
-                        policy,
-                        private_openings=attack_openings,
-                    )
-                    attack_assets, attack_ledger = public_outputs(attack_projection)
-                    attack_context = privacy.publication_binding_context(
-                        attack_materialized,
-                        attack_projection,
-                        attack_ledger,
-                    )
-                    attack_openings_path = (
-                        authority / f"attack-{attack_ordinal}-openings.json"
-                    )
-                    privacy.write_private_authority_file(
-                        attack_openings_path,
-                        privacy.serialize_private_openings(
-                            attack_openings,
-                            attack_context,
-                        ),
-                        label="synthetic attack openings",
-                    )
-                    with (
-                        mock.patch.object(
-                            completion,
-                            "evaluate_completion",
-                            side_effect=structurally_valid_b1,
-                        ),
-                        self.subTest(attack_role=attack_role),
-                        self.assertRaisesRegex(
-                            privacy.PrivacyError,
-                            "publication source evaluator role assertion differs",
-                        ),
-                    ):
-                        privacy.verify_publication_bundle_binding(
-                            index_path=completion_index,
-                            protected_openings=attack_openings_path,
-                            policy=policy,
-                            public_assets=attack_assets,
-                            runtime_receipt_paths=runtime_paths,
-                            manifest_path=root / "synthetic-manifest.json",
-                        )
-                    public_raw = b"".join(attack_assets.values())
-                    self.assertNotIn(bytes(range(32)).hex().encode(), public_raw)
-                    self.assertNotIn(decoy_candidate_bytes, public_raw)
+                public_raw = b"".join(attack_assets.values())
+                assert bytes(range(32)).hex().encode() not in public_raw
+                assert decoy_candidate_bytes not in public_raw
 
+    @pytest.mark.parametrize(
+        "invalid_case",
+        range(5),
+        ids=(
+            "decomposed-key",
+            "duplicate-key",
+            "nested-duplicate-key",
+            "non-string-key",
+            "decomposed-value",
+        ),
+    )
     def test_binding_canonicalization_domains_and_receipt_links_have_fixed_vectors(
         self,
+        invalid_case,
     ):
         value = {"alpha": [1, True, None], "é": {"nested": "ok"}}
         expected_raw = b'{"alpha":[1,true,null],"\xc3\xa9":{"nested":"ok"}}\n'
-        self.assertEqual(privacy.binding_canonical_json_bytes(value), expected_raw)
-        self.assertEqual(
+        assert privacy.binding_canonical_json_bytes(value) == expected_raw
+        assert (
             privacy.tagged_canonical_sha256(
-                privacy.TECHNICAL_INPUT_INVENTORY_DOMAIN,
-                value,
-            ),
-            "eb42d8510ac9c4a51276f193a291a325a3e7d10ac02503c917c2628e14dfc55e",
+                privacy.TECHNICAL_INPUT_INVENTORY_DOMAIN, value
+            )
+            == "eb42d8510ac9c4a51276f193a291a325a3e7d10ac02503c917c2628e14dfc55e"
         )
-        self.assertEqual(
+        assert (
             privacy._tagged_hmac(
-                bytes(range(32)),
-                privacy.PRIVATE_OPENING_BINDING_DOMAIN,
-                value,
-            ),
-            "bd91e96f364e430bb19c92f48b43e9f02dd057edf681e217babcc81496e4167f",
+                bytes(range(32)), privacy.PRIVATE_OPENING_BINDING_DOMAIN, value
+            )
+            == "bd91e96f364e430bb19c92f48b43e9f02dd057edf681e217babcc81496e4167f"
         )
         checked = {
             "body": (
@@ -1433,37 +1455,37 @@ class Issue123PrivacyProjectionTest(unittest.TestCase):
         }
         from benchmarks import issue123_operations as operations
 
-        self.assertEqual(
-            operations.checklist_transition_sha256(checked, "checked"),
-            "f62d341750742410bbadf27495f924dbc2be6b5d7b5c5cb918e2829aefae54e7",
+        assert (
+            operations.checklist_transition_sha256(checked, "checked")
+            == "f62d341750742410bbadf27495f924dbc2be6b5d7b5c5cb918e2829aefae54e7"
         )
         receipt_raw = b'{"kind":"synthetic-receipt","schema_version":1}\n'
-        self.assertEqual(
-            completion._reopen_receipt_file_sha256(receipt_raw),
-            "29f55bda72d534eb1dac97d507e258515816779f77a9957d71e7998114146016",
+        assert (
+            completion._reopen_receipt_file_sha256(receipt_raw)
+            == "29f55bda72d534eb1dac97d507e258515816779f77a9957d71e7998114146016"
         )
-        self.assertFalse(hasattr(completion, "BUNDLE_REOPEN_RECEIPT_DOMAIN"))
-        self.assertNotEqual(
+        assert not (hasattr(completion, "BUNDLE_REOPEN_RECEIPT_DOMAIN"))
+        assert (
             privacy.tagged_canonical_sha256(
-                privacy.TECHNICAL_INPUT_INVENTORY_DOMAIN + "-changed",
-                value,
-            ),
-            "eb42d8510ac9c4a51276f193a291a325a3e7d10ac02503c917c2628e14dfc55e",
+                privacy.TECHNICAL_INPUT_INVENTORY_DOMAIN + "-changed", value
+            )
+            != "eb42d8510ac9c4a51276f193a291a325a3e7d10ac02503c917c2628e14dfc55e"
         )
-        for invalid in (
-            {"e\u0301": 1},
-            {"é": 1, "e\u0301": 2},
-            {"outer": {"é": 1, "e\u0301": 2}},
-            {1: "non-string"},
-            {"safe": "e\u0301"},
-        ):
-            with (
-                self.subTest(invalid=repr(invalid)),
-                self.assertRaises(privacy.PrivacyError) as caught,
-            ):
-                privacy.binding_canonical_json_bytes(invalid)
-            self.assertNotIn("e\u0301", str(caught.exception))
-            self.assertNotIn("é", str(caught.exception))
+        invalid_case_values = tuple(
+            (
+                {"e\u0301": 1},
+                {"é": 1, "e\u0301": 2},
+                {"outer": {"é": 1, "e\u0301": 2}},
+                {1: "non-string"},
+                {"safe": "e\u0301"},
+            )
+        )
+        assert len(invalid_case_values) == 5
+        invalid = invalid_case_values[invalid_case]
+        with pytest.raises(privacy.PrivacyError) as caught:
+            privacy.binding_canonical_json_bytes(invalid)
+        assert "é" not in str(caught.value)
+        assert "é" not in str(caught.value)
 
     def test_private_authority_writer_is_atomic_private_and_symlink_closed(self):
         with tempfile.TemporaryDirectory() as name:
@@ -1482,11 +1504,11 @@ class Issue123PrivacyProjectionTest(unittest.TestCase):
                     label="synthetic private authority",
                     before_commit=lambda: callbacks.append("checked"),
                 )
-            self.assertEqual(final.read_bytes(), b"complete-authority\n")
-            self.assertEqual(stat.S_IMODE(final.stat().st_mode), 0o600)
-            self.assertEqual(callbacks, ["checked"])
-            self.assertGreaterEqual(fsync.call_count, 2)
-            self.assertEqual(list(private_root.glob(".*.tmp-*")), [])
+            assert final.read_bytes() == b"complete-authority\n"
+            assert stat.S_IMODE(final.stat().st_mode) == 384
+            assert callbacks == ["checked"]
+            assert fsync.call_count >= 2
+            assert list(private_root.glob(".*.tmp-*")) == []
 
             callback_root = root / "callback-failure"
             callback_root.mkdir(mode=0o700)
@@ -1496,26 +1518,20 @@ class Issue123PrivacyProjectionTest(unittest.TestCase):
             def reject_commit():
                 raise RuntimeError("private-callback-marker")
 
-            with self.assertRaises(privacy.PrivacyError) as caught:
+            with pytest.raises(privacy.PrivacyError) as caught:
                 privacy.write_private_authority_file(
                     callback_root / "result.json",
                     b"partial-must-not-publish",
                     label="synthetic callback authority",
                     before_commit=reject_commit,
                 )
-            self.assertEqual(
-                str(caught.exception), "private authority file could not be committed"
+            assert str(caught.value) == "private authority file could not be committed"
+            assert "private-callback-marker" not in " ".join(
+                _exception_messages(caught.value)
             )
-            self.assertNotIn(
-                "private-callback-marker",
-                " ".join(_exception_messages(caught.exception)),
-            )
-            self.assertFalse((callback_root / "result.json").exists())
-            self.assertEqual(sentinel.read_bytes(), b"unrelated")
-            self.assertEqual(
-                list(callback_root.glob(".result.json.tmp-*")),
-                [sentinel],
-            )
+            assert not ((callback_root / "result.json").exists())
+            assert sentinel.read_bytes() == b"unrelated"
+            assert list(callback_root.glob(".result.json.tmp-*")) == [sentinel]
 
             partial_root = root / "partial-write"
             partial_root.mkdir(mode=0o700)
@@ -1531,38 +1547,37 @@ class Issue123PrivacyProjectionTest(unittest.TestCase):
 
             with (
                 mock.patch.object(privacy.os, "write", side_effect=partial_then_fail),
-                self.assertRaises(privacy.PrivacyError) as partial_error,
+                pytest.raises(privacy.PrivacyError) as partial_error,
             ):
                 privacy.write_private_authority_file(
                     partial_root / "result.json",
                     b"complete-value",
                     label="synthetic partial authority",
                 )
-            self.assertFalse((partial_root / "result.json").exists())
-            self.assertEqual(list(partial_root.iterdir()), [])
-            self.assertNotIn(
-                "private-write-marker",
-                " ".join(_exception_messages(partial_error.exception)),
+            assert not ((partial_root / "result.json").exists())
+            assert list(partial_root.iterdir()) == []
+            assert "private-write-marker" not in " ".join(
+                _exception_messages(partial_error.value)
             )
 
             symlink_target = root / "symlink-target"
             symlink_target.mkdir(mode=0o700)
             ancestor = root / "linked-private"
             ancestor.symlink_to(symlink_target, target_is_directory=True)
-            with self.assertRaisesRegex(privacy.PrivacyError, "symbolic link"):
+            with pytest.raises(privacy.PrivacyError, match="symbolic link"):
                 privacy.write_private_authority_file(
                     ancestor / "result.json",
                     b"must-not-follow",
                     label="synthetic symlink authority",
                 )
-            self.assertFalse((symlink_target / "result.json").exists())
-            with self.assertRaisesRegex(privacy.PrivacyError, "path is invalid"):
+            assert not ((symlink_target / "result.json").exists())
+            with pytest.raises(privacy.PrivacyError, match="path is invalid"):
                 privacy.write_private_authority_file(
                     None,
                     b"invalid-path",
                     label="synthetic invalid authority",
                 )
-            with self.assertRaisesRegex(privacy.PrivacyError, "forbidden root"):
+            with pytest.raises(privacy.PrivacyError, match="forbidden root"):
                 privacy.write_private_authority_file(
                     private_root / "forbidden.json",
                     b"forbidden",
@@ -1571,13 +1586,13 @@ class Issue123PrivacyProjectionTest(unittest.TestCase):
                 )
             existing = private_root / "existing.json"
             existing.write_bytes(b"sentinel")
-            with self.assertRaisesRegex(privacy.PrivacyError, "could not be committed"):
+            with pytest.raises(privacy.PrivacyError, match="could not be committed"):
                 privacy.write_private_authority_file(
                     existing,
                     b"replacement",
                     label="synthetic no-replace authority",
                 )
-            self.assertEqual(existing.read_bytes(), b"sentinel")
+            assert existing.read_bytes() == b"sentinel"
 
             unsupported_root = root / "unsupported-descriptor-stat"
             unsupported_root.mkdir(mode=0o700)
@@ -1588,9 +1603,8 @@ class Issue123PrivacyProjectionTest(unittest.TestCase):
                     "supports_fd",
                     supports_fd_without_stat,
                 ),
-                self.assertRaisesRegex(
-                    privacy.PrivacyError,
-                    "atomic publication is unsupported",
+                pytest.raises(
+                    privacy.PrivacyError, match="atomic publication is unsupported"
                 ),
             ):
                 privacy.write_private_authority_file(
@@ -1598,278 +1612,283 @@ class Issue123PrivacyProjectionTest(unittest.TestCase):
                     b"unsupported",
                     label="synthetic unsupported authority",
                 )
-            self.assertEqual(list(unsupported_root.iterdir()), [])
+            assert list(unsupported_root.iterdir()) == []
 
-    def test_private_writer_first_fstat_cleanup_is_identity_scoped(self):
+    @pytest.mark.parametrize(
+        "attack_case",
+        range(2),
+        ids=("persistent-no-replacement", "persistent-with-replacement"),
+    )
+    def test_private_writer_first_fstat_cleanup_is_identity_scoped(self, attack_case):
         real_fstat = privacy.os.fstat
         real_stat = privacy.os.stat
-        for attack in ("persistent-no-replacement", "persistent-with-replacement"):
-            with self.subTest(attack=attack), tempfile.TemporaryDirectory() as name:
-                parent = Path(name) / "private"
-                parent.mkdir(mode=0o700)
-                final = parent / "result.json"
-                sentinel = parent / ".result.json.tmp-sentinel"
-                sentinel.write_bytes(b"unrelated-sentinel")
-                sentinel_identity = (sentinel.stat().st_dev, sentinel.stat().st_ino)
-                target_descriptor = None
-                target_fstat_failures = 0
-                replacement_identity = None
-                commit_calls = []
-                canary = "synthetic-persistent-fstat-failure"
+        attack_case_values = tuple(
+            ("persistent-no-replacement", "persistent-with-replacement")
+        )
+        assert len(attack_case_values) == 2
+        attack = attack_case_values[attack_case]
+        with tempfile.TemporaryDirectory() as name:
+            parent = Path(name) / "private"
+            parent.mkdir(mode=0o700)
+            final = parent / "result.json"
+            sentinel = parent / ".result.json.tmp-sentinel"
+            sentinel.write_bytes(b"unrelated-sentinel")
+            sentinel_identity = (sentinel.stat().st_dev, sentinel.stat().st_ino)
+            target_descriptor = None
+            target_fstat_failures = 0
+            replacement_identity = None
+            commit_calls = []
+            canary = "synthetic-persistent-fstat-failure"
 
-                def fail_persistently_for_temp(descriptor):
-                    nonlocal target_descriptor
-                    nonlocal target_fstat_failures
-                    nonlocal replacement_identity
-                    metadata = real_fstat(descriptor)
+            def fail_persistently_for_temp(descriptor):
+                nonlocal target_descriptor
+                nonlocal target_fstat_failures
+                nonlocal replacement_identity
+                metadata = real_fstat(descriptor)
+                if (
+                    target_descriptor is None
+                    and stat.S_ISREG(metadata.st_mode)
+                    and stat.S_IMODE(metadata.st_mode) == 0o600
+                ):
+                    target_descriptor = descriptor
+                if descriptor == target_descriptor:
+                    target_fstat_failures += 1
                     if (
-                        target_descriptor is None
-                        and stat.S_ISREG(metadata.st_mode)
-                        and stat.S_IMODE(metadata.st_mode) == 0o600
+                        target_fstat_failures == 1
+                        and attack == "persistent-with-replacement"
                     ):
-                        target_descriptor = descriptor
-                    if descriptor == target_descriptor:
-                        target_fstat_failures += 1
-                        if (
-                            target_fstat_failures == 1
-                            and attack == "persistent-with-replacement"
-                        ):
-                            temporary = next(
-                                path
-                                for path in parent.glob(".result.json.tmp-*")
-                                if path != sentinel
-                            )
-                            temporary.unlink()
-                            temporary.write_bytes(b"unrelated-replacement")
-                            replacement = real_stat(
-                                temporary,
-                                follow_symlinks=False,
-                            )
-                            replacement_identity = (
-                                replacement.st_dev,
-                                replacement.st_ino,
-                            )
-                        raise OSError(canary)
-                    return metadata
+                        temporary = next(
+                            path
+                            for path in parent.glob(".result.json.tmp-*")
+                            if path != sentinel
+                        )
+                        temporary.unlink()
+                        temporary.write_bytes(b"unrelated-replacement")
+                        replacement = real_stat(
+                            temporary,
+                            follow_symlinks=False,
+                        )
+                        replacement_identity = (
+                            replacement.st_dev,
+                            replacement.st_ino,
+                        )
+                    raise OSError(canary)
+                return metadata
 
-                with (
-                    mock.patch.object(
-                        privacy.os,
-                        "fstat",
-                        side_effect=fail_persistently_for_temp,
-                    ),
-                    self.assertRaises(privacy.PrivacyError) as caught,
-                ):
-                    privacy.write_private_authority_file(
-                        final,
-                        b"candidate-authority",
-                        label="synthetic first-fstat authority",
-                        before_commit=lambda: commit_calls.append("committed"),
-                    )
-                self.assertEqual(
-                    str(caught.exception),
-                    "private authority file could not be committed",
+            with (
+                mock.patch.object(
+                    privacy.os,
+                    "fstat",
+                    side_effect=fail_persistently_for_temp,
+                ),
+                pytest.raises(privacy.PrivacyError) as caught,
+            ):
+                privacy.write_private_authority_file(
+                    final,
+                    b"candidate-authority",
+                    label="synthetic first-fstat authority",
+                    before_commit=lambda: commit_calls.append("committed"),
                 )
-                diagnostics = " ".join(
-                    (
-                        str(caught.exception),
-                        repr(caught.exception),
-                        repr(caught.exception.__cause__),
-                        repr(caught.exception.__context__),
-                        "".join(traceback.format_exception(caught.exception)),
-                    )
+            assert str(caught.value) == "private authority file could not be committed"
+            diagnostics = " ".join(
+                (
+                    str(caught.value),
+                    repr(caught.value),
+                    repr(caught.value.__cause__),
+                    repr(caught.value.__context__),
+                    "".join(traceback.format_exception(caught.value)),
                 )
-                self.assertNotIn(canary, diagnostics)
-                self.assertFalse(final.exists())
-                self.assertEqual(commit_calls, [])
-                self.assertEqual(target_fstat_failures, 2)
-                self.assertIsNotNone(target_descriptor)
-                with self.assertRaises(OSError):
-                    real_fstat(target_descriptor)
-                self.assertEqual(
-                    (sentinel.stat().st_dev, sentinel.stat().st_ino),
-                    sentinel_identity,
-                )
-                self.assertEqual(sentinel.read_bytes(), b"unrelated-sentinel")
-                owned = [
-                    path
-                    for path in parent.glob(".result.json.tmp-*")
-                    if path != sentinel
-                ]
-                if attack == "persistent-no-replacement":
-                    self.assertEqual(owned, [])
-                else:
-                    self.assertEqual(len(owned), 1)
-                    self.assertEqual(
-                        (owned[0].stat().st_dev, owned[0].stat().st_ino),
-                        replacement_identity,
-                    )
-                    self.assertEqual(owned[0].read_bytes(), b"unrelated-replacement")
+            )
+            assert canary not in diagnostics
+            assert not (final.exists())
+            assert commit_calls == []
+            assert target_fstat_failures == 2
+            assert target_descriptor is not None
+            with pytest.raises(OSError):
+                real_fstat(target_descriptor)
+            assert (
+                sentinel.stat().st_dev,
+                sentinel.stat().st_ino,
+            ) == sentinel_identity
+            assert sentinel.read_bytes() == b"unrelated-sentinel"
+            owned = [
+                path for path in parent.glob(".result.json.tmp-*") if path != sentinel
+            ]
+            if attack == "persistent-no-replacement":
+                assert owned == []
+            else:
+                assert len(owned) == 1
+                assert (
+                    owned[0].stat().st_dev,
+                    owned[0].stat().st_ino,
+                ) == replacement_identity
+                assert owned[0].read_bytes() == b"unrelated-replacement"
 
-    def test_private_writer_post_link_failures_report_committed_state(self):
+    @pytest.mark.parametrize(
+        "attack_case", range(2), ids=("parent-fsync", "final-reopen")
+    )
+    def test_private_writer_post_link_failures_report_committed_state(
+        self, attack_case
+    ):
         cases = ("parent-fsync", "final-reopen")
-        for attack in cases:
-            with self.subTest(attack=attack), tempfile.TemporaryDirectory() as name:
-                parent = Path(name) / "private"
-                parent.mkdir(mode=0o700)
-                final = parent / "result.json"
-                raw = b"complete-authority\n"
-                real_fsync = privacy.os.fsync
-                real_fstat = privacy.os.fstat
-                directory_fsyncs = 0
-                regular_fstats = 0
+        # These stages jointly cover the post-link transition and assert the same
+        # committed-file identity contract after each late failure.
+        attack_case_values = tuple(cases)
+        assert len(attack_case_values) == 2
+        attack = attack_case_values[attack_case]
+        with tempfile.TemporaryDirectory() as name:
+            parent = Path(name) / "private"
+            parent.mkdir(mode=0o700)
+            final = parent / "result.json"
+            raw = b"complete-authority\n"
+            real_fsync = privacy.os.fsync
+            real_fstat = privacy.os.fstat
+            directory_fsyncs = 0
+            regular_fstats = 0
 
-                def fail_parent_fsync(descriptor):
-                    nonlocal directory_fsyncs
-                    metadata = privacy.os.fstat(descriptor)
-                    if stat.S_ISDIR(metadata.st_mode):
-                        directory_fsyncs += 1
-                        if directory_fsyncs == 1:
-                            raise OSError("synthetic-parent-fsync-failure")
-                    return real_fsync(descriptor)
+            def fail_parent_fsync(descriptor):
+                nonlocal directory_fsyncs
+                metadata = privacy.os.fstat(descriptor)
+                if stat.S_ISDIR(metadata.st_mode):
+                    directory_fsyncs += 1
+                    if directory_fsyncs == 1:
+                        raise OSError("synthetic-parent-fsync-failure")
+                return real_fsync(descriptor)
 
-                def fail_final_reopen_fstat(descriptor):
-                    nonlocal regular_fstats
-                    metadata = real_fstat(descriptor)
-                    if stat.S_ISREG(metadata.st_mode):
-                        regular_fstats += 1
-                    if regular_fstats == 3:
-                        raise OSError("synthetic-final-reopen-failure")
-                    return metadata
+            def fail_final_reopen_fstat(descriptor):
+                nonlocal regular_fstats
+                metadata = real_fstat(descriptor)
+                if stat.S_ISREG(metadata.st_mode):
+                    regular_fstats += 1
+                if regular_fstats == 3:
+                    raise OSError("synthetic-final-reopen-failure")
+                return metadata
 
-                patcher = (
-                    mock.patch.object(
-                        privacy.os,
-                        "fsync",
-                        side_effect=fail_parent_fsync,
-                    )
-                    if attack == "parent-fsync"
-                    else mock.patch.object(
-                        privacy.os,
-                        "fstat",
-                        side_effect=fail_final_reopen_fstat,
-                    )
+            patcher = (
+                mock.patch.object(
+                    privacy.os,
+                    "fsync",
+                    side_effect=fail_parent_fsync,
                 )
-                with (
-                    patcher,
-                    self.assertRaises(privacy.PrivateAuthorityCommitError) as caught,
-                ):
-                    privacy.write_private_authority_file(
-                        final,
-                        raw,
-                        label="synthetic committed authority",
-                    )
-                self.assertTrue(caught.exception.committed)
-                self.assertEqual(
-                    str(caught.exception),
-                    "private authority file was committed but final verification failed",
+                if attack == "parent-fsync"
+                else mock.patch.object(
+                    privacy.os,
+                    "fstat",
+                    side_effect=fail_final_reopen_fstat,
                 )
-                self.assertEqual(final.read_bytes(), raw)
-                self.assertEqual(stat.S_IMODE(final.stat().st_mode), 0o600)
-                self.assertEqual(list(parent.glob(".result.json.tmp-*")), [])
+            )
+            with (
+                patcher,
+                pytest.raises(privacy.PrivateAuthorityCommitError) as caught,
+            ):
+                privacy.write_private_authority_file(
+                    final,
+                    raw,
+                    label="synthetic committed authority",
+                )
+            assert caught.value.committed
+            assert (
+                str(caught.value)
+                == "private authority file was committed but final verification failed"
+            )
+            assert final.read_bytes() == raw
+            assert stat.S_IMODE(final.stat().st_mode) == 384
+            assert list(parent.glob(".result.json.tmp-*")) == []
 
     def test_projects_exact_public_schema_without_private_material(self):
         openings = privacy.PrivateOpenings()
         projected = self.project(openings=openings)
-        self.assertEqual(
-            set(projected),
-            {
-                "schema_version",
-                "kind",
-                "bindings",
-                "technical_scopes",
-                "correctness_commitments",
-                "execution_witness",
-                "raw_timing",
-                "event_profiler",
-            },
+        assert set(projected) == {
+            "schema_version",
+            "kind",
+            "bindings",
+            "technical_scopes",
+            "correctness_commitments",
+            "execution_witness",
+            "raw_timing",
+            "event_profiler",
+        }
+        assert [scope["scope"] for scope in projected["technical_scopes"]] == list(
+            privacy.TECHNICAL_SCOPE_ORDER
         )
-        self.assertEqual(
-            [scope["scope"] for scope in projected["technical_scopes"]],
-            list(privacy.TECHNICAL_SCOPE_ORDER),
-        )
-        self.assertNotIn("operations", repr(projected))
-        self.assertNotIn("private-host", repr(projected))
+        assert "operations" not in repr(projected)
+        assert "private-host" not in repr(projected)
         raw = privacy.canonical_json_bytes(projected)
-        self.assertNotIn(self.salt.hex().encode(), raw)
-        self.assertNotIn(b"private-host", raw)
-        self.assertNotIn(struct.pack("<2d", 1.0, 2.0), raw)
-        self.assertEqual(repr(openings), "<PrivateOpenings redacted>")
-        self.assertEqual(openings.salt_for_private_verification(), self.salt)
-        self.assertEqual(
-            openings.identity_for_private_verification("cpu", "machine"),
-            {"opaque_private_value": "private-host-0"},
-        )
+        assert self.salt.hex().encode() not in raw
+        assert b"private-host" not in raw
+        assert struct.pack("<2d", 1.0, 2.0) not in raw
+        assert repr(openings) == "<PrivateOpenings redacted>"
+        assert openings.salt_for_private_verification() == self.salt
+        assert openings.identity_for_private_verification("cpu", "machine") == {
+            "opaque_private_value": "private-host-0"
+        }
 
     def test_preserves_timing_samples_exactly_and_recomputes_statistics(self):
         projected = self.project()
         timing = projected["technical_scopes"][0]["timings"][0]
-        self.assertEqual(timing["samples"], [0.003, 0.001, 0.002])
-        self.assertEqual(timing["sample_count"], 3)
-        self.assertEqual(timing["median_seconds"], 0.002)
-        self.assertEqual(timing["mad_seconds"], 0.001)
-        self.assertEqual(timing["relative_mad"], 0.5)
-        self.assertEqual(
-            projected["raw_timing"]["records"][0]["samples"],
-            [0.003, 0.001, 0.002],
-        )
+        assert timing["samples"] == [0.003, 0.001, 0.002]
+        assert timing["sample_count"] == 3
+        assert timing["median_seconds"] == 0.002
+        assert timing["mad_seconds"] == 0.001
+        assert timing["relative_mad"] == 0.5
+        assert projected["raw_timing"]["records"][0]["samples"] == [0.003, 0.001, 0.002]
 
     def test_trace_is_event_complete_local_and_dense(self):
         trace = self.project()["technical_scopes"][0]["traces"][0]
         events = trace["events"]
-        self.assertEqual(trace["clock"], privacy.LOCAL_CLOCK)
-        self.assertEqual([event["ordinal"] for event in events], list(range(9)))
-        self.assertEqual(events[0]["start_us"], 0)
-        self.assertEqual(events[1]["start_us"], 0.0)
-        self.assertEqual(sorted({event["process_ordinal"] for event in events}), [0, 1])
-        self.assertEqual(
-            sorted(
-                {
-                    event["stream_ordinal"]
-                    for event in events
-                    if event["stream_ordinal"] is not None
-                }
-            ),
-            [0, 1],
-        )
-        self.assertNotIn("9017", repr(trace))
-        self.assertNotIn("stream-17", repr(trace))
-        self.assertNotIn("allocation-address", repr(trace))
-        self.assertEqual(events[1]["live_allocated_bytes"], 64)
-        self.assertEqual(events[2]["live_allocated_bytes"], 0)
-        self.assertIsNone(events[3]["live_allocated_bytes"])
+        assert trace["clock"] == privacy.LOCAL_CLOCK
+        assert [event["ordinal"] for event in events] == list(range(9))
+        assert events[0]["start_us"] == 0
+        assert events[1]["start_us"] == 0.0
+        assert sorted({event["process_ordinal"] for event in events}) == [0, 1]
+        assert sorted(
+            {
+                event["stream_ordinal"]
+                for event in events
+                if event["stream_ordinal"] is not None
+            }
+        ) == [0, 1]
+        assert "9017" not in repr(trace)
+        assert "stream-17" not in repr(trace)
+        assert "allocation-address" not in repr(trace)
+        assert events[1]["live_allocated_bytes"] == 64
+        assert events[2]["live_allocated_bytes"] == 0
+        assert events[3]["live_allocated_bytes"] is None
         summary = trace["summary"]
-        self.assertEqual(summary["allocation_net_bytes"], 0)
-        self.assertEqual(summary["live_allocation_growth_bytes"], 0)
-        self.assertEqual(summary["kernel_launches"], 2)
-        self.assertEqual(summary["cuda_graph_launches"], 1)
-        self.assertEqual(summary["nccl_compute_overlap_us"], 5.0)
-        self.assertEqual(summary["overlap_fraction"], 0.5)
+        assert summary["allocation_net_bytes"] == 0
+        assert summary["live_allocation_growth_bytes"] == 0
+        assert summary["kernel_launches"] == 2
+        assert summary["cuda_graph_launches"] == 1
+        assert summary["nccl_compute_overlap_us"] == 5.0
+        assert summary["overlap_fraction"] == 0.5
 
     def test_correctness_publishes_arithmetic_and_commitments_only(self):
         document = self.project()["correctness_commitments"]
         array = document["cases"][0]["captures"][0]["arrays"][0]
-        self.assertTrue(array["comparison"]["passed"])
-        self.assertFalse(array["comparison"]["reference_all_zero"])
-        self.assertTrue(array["comparison"]["zero_reference_exact"])
-        self.assertRegex(array["commitments"]["reference"], r"[0-9a-f]{64}\Z")
-        self.assertRegex(array["commitments"]["candidate"], r"[0-9a-f]{64}\Z")
-        self.assertEqual(document["closure"]["case_count"], 5)
-        self.assertEqual(document["closure"]["capture_count"], 5)
-        self.assertEqual(document["closure"]["array_count"], 5)
-        self.assertEqual(len(document["closure"]["inventory_sha256"]), 64)
-        self.assertNotIn("reference_bytes", repr(document))
-        self.assertNotIn("candidate_bytes", repr(document))
+        assert array["comparison"]["passed"]
+        assert not (array["comparison"]["reference_all_zero"])
+        assert array["comparison"]["zero_reference_exact"]
+        assert (
+            re.search("[0-9a-f]{64}\\Z", array["commitments"]["reference"]) is not None
+        )
+        assert (
+            re.search("[0-9a-f]{64}\\Z", array["commitments"]["candidate"]) is not None
+        )
+        assert document["closure"]["case_count"] == 5
+        assert document["closure"]["capture_count"] == 5
+        assert document["closure"]["array_count"] == 5
+        assert len(document["closure"]["inventory_sha256"]) == 64
+        assert "reference_bytes" not in repr(document)
+        assert "candidate_bytes" not in repr(document)
 
     def test_execution_witness_binds_claims_traces_and_exact_job_identity(self):
         projected = self.project()
         witness = projected["execution_witness"]
-        self.assertEqual(set(witness), {"schema_version", "kind", "bindings", "claims"})
-        self.assertEqual(witness["kind"], privacy.EXECUTION_WITNESS_KIND)
-        self.assertEqual(privacy.EXECUTION_WITNESS_PATH, "execution/witness.json")
-        self.assertEqual(
-            [claim["claim"] for claim in witness["claims"]],
-            list(privacy.EXECUTION_CLAIM_ORDER),
+        assert set(witness) == {"schema_version", "kind", "bindings", "claims"}
+        assert witness["kind"] == privacy.EXECUTION_WITNESS_KIND
+        assert privacy.EXECUTION_WITNESS_PATH == "execution/witness.json"
+        assert [claim["claim"] for claim in witness["claims"]] == list(
+            privacy.EXECUTION_CLAIM_ORDER
         )
         scopes = {scope["scope"]: scope for scope in projected["technical_scopes"]}
         for claim in witness["claims"]:
@@ -1886,19 +1905,15 @@ class Issue123PrivacyProjectionTest(unittest.TestCase):
                 "events": trace["events"],
                 "summary": trace["summary"],
             }
-            self.assertEqual(
-                claim["semantic_inventory_sha256"],
-                _canonical_sha256(signatures),
+            assert claim["semantic_inventory_sha256"] == _canonical_sha256(signatures)
+            assert claim["normalized_trace_sha256"] == _canonical_sha256(
+                normalized_trace
             )
-            self.assertEqual(
-                claim["normalized_trace_sha256"],
-                _canonical_sha256(normalized_trace),
-            )
-            self.assertEqual(claim["event_count"], len(trace["events"]))
-            self.assertEqual(claim["validation_workflow"], "CI")
-            self.assertEqual(claim["validator_job"], self.policy["bindings"]["jobs"][0])
-        self.assertNotIn("private-cpu-worker", repr(witness))
-        self.assertNotIn("private-cuda-worker", repr(witness))
+            assert claim["event_count"] == len(trace["events"])
+            assert claim["validation_workflow"] == "CI"
+            assert claim["validator_job"] == self.policy["bindings"]["jobs"][0]
+        assert "private-cpu-worker" not in repr(witness)
+        assert "private-cuda-worker" not in repr(witness)
 
     def test_execution_claims_reject_incompatible_semantics_and_job_rebinding(self):
         policy = copy.deepcopy(self.policy)
@@ -1913,7 +1928,7 @@ class Issue123PrivacyProjectionTest(unittest.TestCase):
             kernel_launches=1,
         )
         private["scopes"][0]["traces"][1]["trace_bytes"] = _cuda_eager_trace_bytes()
-        with self.assertRaisesRegex(privacy.PrivacyError, "cpu-eager witness"):
+        with pytest.raises(privacy.PrivacyError, match="cpu-eager witness"):
             privacy.project_publication(private, policy, salt=self.salt)
 
         policy = copy.deepcopy(self.policy)
@@ -1940,7 +1955,7 @@ class Issue123PrivacyProjectionTest(unittest.TestCase):
             }
         )
         private["scopes"][0]["traces"][1]["trace_bytes"] = _json_bytes(cpu_trace)
-        with self.assertRaisesRegex(privacy.PrivacyError, "cpu-eager witness"):
+        with pytest.raises(privacy.PrivacyError, match="cpu-eager witness"):
             privacy.project_publication(private, policy, salt=self.salt)
 
         policy = copy.deepcopy(self.policy)
@@ -1963,12 +1978,12 @@ class Issue123PrivacyProjectionTest(unittest.TestCase):
         private["scopes"][single_gpu_index]["traces"][1]["trace_bytes"] = _json_bytes(
             eager_trace
         )
-        with self.assertRaisesRegex(privacy.PrivacyError, "cuda-eager witness"):
+        with pytest.raises(privacy.PrivacyError, match="cuda-eager witness"):
             privacy.project_publication(private, policy, salt=self.salt)
 
         policy = copy.deepcopy(self.policy)
         policy["execution_witnesses"][1]["validator_job_name"] = "CodeQL / python"
-        with self.assertRaisesRegex(privacy.PrivacyError, "validator job differs"):
+        with pytest.raises(privacy.PrivacyError, match="validator job differs"):
             privacy.project_publication(self.private, policy, salt=self.salt)
 
         policy = copy.deepcopy(self.policy)
@@ -1976,7 +1991,7 @@ class Issue123PrivacyProjectionTest(unittest.TestCase):
             policy["execution_witnesses"][1],
             policy["execution_witnesses"][0],
         )
-        with self.assertRaisesRegex(privacy.PrivacyError, "claim order"):
+        with pytest.raises(privacy.PrivacyError, match="claim order"):
             privacy.project_publication(self.private, policy, salt=self.salt)
 
     def test_eager_witnesses_reject_coherently_declared_compiled_regions(self):
@@ -2006,9 +2021,9 @@ class Issue123PrivacyProjectionTest(unittest.TestCase):
         cpu_trace["traceEvents"].append(compiled_event)
         private["scopes"][0]["traces"][1]["trace_bytes"] = _json_bytes(cpu_trace)
         normalized = privacy.normalize_trace(_json_bytes(cpu_trace))
-        self.assertEqual(normalized["summary"]["compiled_region_events"], 1)
-        with self.assertRaisesRegex(
-            privacy.PrivacyError, "cpu-eager witness semantics differ"
+        assert normalized["summary"]["compiled_region_events"] == 1
+        with pytest.raises(
+            privacy.PrivacyError, match="cpu-eager witness semantics differ"
         ):
             privacy.project_publication(private, policy, salt=self.salt)
 
@@ -2032,41 +2047,41 @@ class Issue123PrivacyProjectionTest(unittest.TestCase):
             cuda_trace
         )
         normalized = privacy.normalize_trace(_json_bytes(cuda_trace))
-        self.assertEqual(normalized["summary"]["compiled_region_events"], 1)
-        with self.assertRaisesRegex(
-            privacy.PrivacyError, "cuda-eager witness semantics differ"
+        assert normalized["summary"]["compiled_region_events"] == 1
+        with pytest.raises(
+            privacy.PrivacyError, match="cuda-eager witness semantics differ"
         ):
             privacy.project_publication(private, policy, salt=self.salt)
 
     def test_fresh_default_salts_change_low_entropy_commitments(self):
         first = privacy.project_publication(self.private, self.policy)
         second = privacy.project_publication(self.private, self.policy)
-        self.assertNotEqual(
-            first["technical_scopes"][0]["identity_commitments"][0]["commitment"],
-            second["technical_scopes"][0]["identity_commitments"][0]["commitment"],
+        assert (
+            first["technical_scopes"][0]["identity_commitments"][0]["commitment"]
+            != second["technical_scopes"][0]["identity_commitments"][0]["commitment"]
         )
-        self.assertNotEqual(
+        assert (
             first["correctness_commitments"]["cases"][0]["captures"][0]["arrays"][0][
                 "commitments"
-            ],
-            second["correctness_commitments"]["cases"][0]["captures"][0]["arrays"][0][
-                "commitments"
-            ],
+            ]
+            != second["correctness_commitments"]["cases"][0]["captures"][0]["arrays"][
+                0
+            ]["commitments"]
         )
 
     def test_rejects_invalid_or_reused_private_openings(self):
-        with self.assertRaisesRegex(TypeError, "unexpected keyword argument 'salt'"):
+        with pytest.raises(TypeError, match="unexpected keyword argument 'salt'"):
             self._production_project_publication(
                 self.private, self.policy, salt=self.salt
             )
-        with self.assertRaisesRegex(privacy.PrivacyError, "32 private bytes"):
+        with pytest.raises(privacy.PrivacyError, match="32 private bytes"):
             with mock.patch.object(
                 privacy.secrets, "token_bytes", return_value=b"short"
             ):
                 self._production_project_publication(self.private, self.policy)
         openings = privacy.PrivateOpenings()
         self.project(openings=openings)
-        with self.assertRaisesRegex(privacy.PrivacyError, "already used"):
+        with pytest.raises(privacy.PrivacyError, match="already used"):
             self.project(openings=openings)
 
     def test_private_sixth_scope_and_operations_fields_are_rejected(self):
@@ -2082,30 +2097,36 @@ class Issue123PrivacyProjectionTest(unittest.TestCase):
                 "correctness": [],
             }
         )
-        with self.assertRaisesRegex(privacy.PrivacyError, "scope closure"):
+        with pytest.raises(privacy.PrivacyError, match="scope closure"):
             privacy.project_publication(private, self.policy, salt=self.salt)
         private = copy.deepcopy(self.private)
         private["operations"] = {}
-        with self.assertRaisesRegex(privacy.PrivacyError, "fields differ"):
+        with pytest.raises(privacy.PrivacyError, match="fields differ"):
             privacy.project_publication(private, self.policy, salt=self.salt)
 
-    def test_stale_sha_manifest_run_attempt_and_job_bindings_fail(self):
-        mutations = (
-            ("final_sha", "c" * 40),
-            ("manifest_sha256", "d" * 64),
-        )
-        for field, replacement in mutations:
-            with self.subTest(field=field):
-                private = copy.deepcopy(self.private)
-                private["bindings"][field] = replacement
-                with self.assertRaisesRegex(privacy.PrivacyError, "stale"):
-                    privacy.project_publication(private, self.policy, salt=self.salt)
-        for field in ("run_id", "run_attempt", "job_id"):
-            with self.subTest(field=field):
-                private = copy.deepcopy(self.private)
-                private["bindings"]["jobs"][0][field] += 1000
-                with self.assertRaises(privacy.PrivacyError):
-                    privacy.project_publication(private, self.policy, salt=self.salt)
+    @pytest.mark.parametrize(
+        ("field", "replacement", "job_field"),
+        (
+            ("final_sha", "c" * 40, False),
+            ("manifest_sha256", "d" * 64, False),
+            ("run_id", 1000, True),
+            ("run_attempt", 1000, True),
+            ("job_id", 1000, True),
+        ),
+        ids=("final-sha", "manifest-sha", "run-id", "run-attempt", "job-id"),
+    )
+    def test_stale_sha_manifest_run_attempt_and_job_bindings_fail(
+        self, field, replacement, job_field
+    ):
+        private = copy.deepcopy(self.private)
+        if job_field:
+            private["bindings"]["jobs"][0][field] += replacement
+            context = pytest.raises(privacy.PrivacyError)
+        else:
+            private["bindings"][field] = replacement
+            context = pytest.raises(privacy.PrivacyError, match="stale")
+        with context:
+            privacy.project_publication(private, self.policy, salt=self.salt)
 
     def test_descriptor_and_manifest_rehashing_cannot_change_trusted_closure(self):
         private = copy.deepcopy(self.private)
@@ -2113,145 +2134,199 @@ class Issue123PrivacyProjectionTest(unittest.TestCase):
         payload["bytes"] += b"tampered"
         payload["sha256"] = hashlib.sha256(payload["bytes"]).hexdigest()
         private["bindings"]["manifest_sha256"] = "e" * 64
-        with self.assertRaises(privacy.PrivacyError):
+        with pytest.raises(privacy.PrivacyError):
             privacy.project_publication(private, self.policy, salt=self.salt)
 
-    def test_timing_companion_metadata_and_nonfinite_samples_fail(self):
+    def test_timing_companion_metadata_fails(self):
         private = copy.deepcopy(self.private)
         private["scopes"][0]["timings"][0]["hostname"] = "secret"
-        with self.assertRaisesRegex(privacy.PrivacyError, "fields differ"):
+        with pytest.raises(privacy.PrivacyError, match="fields differ"):
             privacy.project_publication(private, self.policy, salt=self.salt)
-        for value in (math.nan, math.inf, 0.0, -1.0, True):
-            with self.subTest(value=value):
-                private = copy.deepcopy(self.private)
-                private["scopes"][0]["timings"][0]["samples"][1] = value
-                with self.assertRaises(privacy.PrivacyError):
-                    privacy.project_publication(private, self.policy, salt=self.salt)
 
-    def test_missing_extra_or_unknown_trace_events_fail_closed(self):
-        cases = []
-        missing = _trace_events()[:-1]
-        cases.append(missing)
-        extra = _trace_events()
-        extra.append(copy.deepcopy(extra[-1]))
-        extra[-1]["ts"] += 3
-        cases.append(extra)
-        unknown = _trace_events()
-        unknown[-1]["name"] = "free form operation"
-        unknown[-1]["cat"] = "user_annotation"
-        cases.append(unknown)
-        for index, events in enumerate(cases):
-            with self.subTest(index=index):
-                private = copy.deepcopy(self.private)
-                private["scopes"][0]["traces"][0]["trace_bytes"] = _trace_bytes(events)
-                with self.assertRaises(privacy.PrivacyError):
-                    privacy.project_publication(private, self.policy, salt=self.salt)
+    @pytest.mark.parametrize(
+        "value",
+        (math.nan, math.inf, 0.0, -1.0, True),
+        ids=("nan", "infinity", "zero", "negative", "boolean"),
+    )
+    def test_nonfinite_or_nonpositive_timing_samples_fail(self, value):
+        private = copy.deepcopy(self.private)
+        private["scopes"][0]["timings"][0]["samples"][1] = value
+        with pytest.raises(privacy.PrivacyError):
+            privacy.project_publication(private, self.policy, salt=self.salt)
 
-    def test_trace_rejects_unknown_fields_args_paths_wall_clock_and_duplicates(self):
-        traces = []
+    @pytest.mark.parametrize("mutation", ("missing", "extra", "unknown"), ids=str)
+    def test_missing_extra_or_unknown_trace_events_fail_closed(self, mutation):
         events = _trace_events()
-        events[-1]["stack"] = ["frame"]
-        traces.append(_trace_bytes(events))
+        if mutation == "missing":
+            events.pop()
+        elif mutation == "extra":
+            events.append(copy.deepcopy(events[-1]))
+            events[-1]["ts"] += 3
+        else:
+            events[-1]["name"] = "free form operation"
+            events[-1]["cat"] = "user_annotation"
+        private = copy.deepcopy(self.private)
+        private["scopes"][0]["traces"][0]["trace_bytes"] = _trace_bytes(events)
+        with pytest.raises(privacy.PrivacyError):
+            privacy.project_publication(private, self.policy, salt=self.salt)
+
+    @pytest.mark.parametrize(
+        "mutation",
+        ("unknown-field", "call-stack", "path-name", "wall-clock", "duplicate-key"),
+        ids=str,
+    )
+    def test_trace_rejects_unknown_fields_args_paths_wall_clock_and_duplicates(
+        self, mutation
+    ):
         events = _trace_events()
-        events[-1]["args"][
-            "Call stack"
-        ] = "/Users/fixture-person-invalid/project/file.py"
-        traces.append(_trace_bytes(events))
-        events = _trace_events()
-        events[-1]["name"] = "/tmp/private/kernel"
-        traces.append(_trace_bytes(events))
-        traces.append(
-            _json_bytes(
+        if mutation == "unknown-field":
+            events[-1]["stack"] = ["frame"]
+            raw = _trace_bytes(events)
+        elif mutation == "call-stack":
+            events[-1]["args"][
+                "Call stack"
+            ] = "/Users/fixture-person-invalid/project/file.py"
+            raw = _trace_bytes(events)
+        elif mutation == "path-name":
+            events[-1]["name"] = "/tmp/private/kernel"
+            raw = _trace_bytes(events)
+        elif mutation == "wall-clock":
+            raw = _json_bytes(
                 {
-                    "traceEvents": _trace_events(),
+                    "traceEvents": events,
                     "baseTimeNanoseconds": 1_700_000_000_000_000_000,
                 }
             )
+        else:
+            raw = b'{"traceEvents":[],"traceEvents":[]}'
+        with pytest.raises(privacy.PrivacyError):
+            privacy.normalize_trace(raw)
+
+    @pytest.mark.parametrize(
+        "index_events_case",
+        range(7),
+        ids=(
+            "allocation-net",
+            "graph-break",
+            "recompile",
+            "fallback",
+            "host-to-device",
+            "missing-device-to-host",
+            "reversed-flow-time",
+        ),
+    )
+    def test_trace_semantic_invariants_cannot_be_redeclared(self, index_events_case):
+        self._check_trace_semantic_invariants_cannot_be_redeclared_phase(
+            phase="event_order", index_events_case=index_events_case
         )
-        traces.append(b'{"traceEvents":[],"traceEvents":[]}')
-        for index, raw in enumerate(traces):
-            with self.subTest(index=index):
-                with self.assertRaises(privacy.PrivacyError):
-                    privacy.normalize_trace(raw)
 
-    def test_trace_semantic_invariants_cannot_be_redeclared(self):
-        changes = []
-        events = _trace_events()
-        events[2]["args"]["Bytes"] = -32
-        events[2]["args"]["Total Allocated"] = 32
-        changes.append(events)
-        events = _trace_events()
-        events[-1]["name"] = "Graph break: secret reason"
-        events[-1]["cat"] = "user_annotation"
-        changes.append(events)
-        events = _trace_events()
-        events[-1]["name"] = "torch recompile"
-        events[-1]["cat"] = "user_annotation"
-        changes.append(events)
-        events = _trace_events()
-        events[-1]["name"] = "backend fallback"
-        events[-1]["cat"] = "user_annotation"
-        changes.append(events)
-        events = _trace_events()
-        events[7]["name"] = "Memcpy HtoD"
-        changes.append(events)
-        events = _trace_events()
-        events[4] = copy.deepcopy(events[-1])
-        events[4]["ts"] = 1_700_000_000_003
-        changes.append(events)
-        events = _trace_events()
-        events[6]["ts"] = 1_700_000_000_030
-        changes.append(events)
-        for index, events in enumerate(changes):
-            with self.subTest(index=index):
-                private = copy.deepcopy(self.private)
-                private["scopes"][0]["traces"][0]["trace_bytes"] = _trace_bytes(events)
-                with self.assertRaises(privacy.PrivacyError):
-                    privacy.project_publication(private, self.policy, salt=self.salt)
-
-        for field in (
-            "allocation_net_bytes",
-            "graph_breaks",
+    @pytest.mark.parametrize(
+        "field_case",
+        range(6),
+        ids=(
+            "allocation-net",
+            "graph-breaks",
             "recompiles",
             "fallbacks",
-            "host_to_device_events",
-            "device_to_host_events",
-        ):
-            with self.subTest(redeclared=field):
-                policy = copy.deepcopy(self.policy)
-                policy["scopes"][0]["traces"][0][field] = 1
-                with self.assertRaises(privacy.PrivacyError):
-                    privacy.project_publication(self.private, policy, salt=self.salt)
+            "host-to-device",
+            "device-to-host",
+        ),
+    )
+    def test_trace_semantic_invariants_cannot_be_redeclared_policy_flags(
+        self, field_case
+    ):
+        self._check_trace_semantic_invariants_cannot_be_redeclared_phase(
+            phase="policy_flags", field_case=field_case
+        )
+
+    def _check_trace_semantic_invariants_cannot_be_redeclared_phase(
+        self, *, phase, index_events_case=None, field_case=None
+    ):
+        if phase == "event_order":
+            changes = []
+            events = _trace_events()
+            events[2]["args"]["Bytes"] = -32
+            events[2]["args"]["Total Allocated"] = 32
+            changes.append(events)
+            events = _trace_events()
+            events[-1]["name"] = "Graph break: secret reason"
+            events[-1]["cat"] = "user_annotation"
+            changes.append(events)
+            events = _trace_events()
+            events[-1]["name"] = "torch recompile"
+            events[-1]["cat"] = "user_annotation"
+            changes.append(events)
+            events = _trace_events()
+            events[-1]["name"] = "backend fallback"
+            events[-1]["cat"] = "user_annotation"
+            changes.append(events)
+            events = _trace_events()
+            events[7]["name"] = "Memcpy HtoD"
+            changes.append(events)
+            events = _trace_events()
+            events[4] = copy.deepcopy(events[-1])
+            events[4]["ts"] = 1_700_000_000_003
+            changes.append(events)
+            events = _trace_events()
+            events[6]["ts"] = 1_700_000_000_030
+            changes.append(events)
+            # Preserve the event mutations as one semantic-inventory sweep, followed
+            # by the matching summary-field redeclaration inventory below.
+            index_events_case_values = tuple(enumerate(changes))
+            assert len(index_events_case_values) == 7
+            index, events = index_events_case_values[index_events_case]
+            private = copy.deepcopy(self.private)
+            private["scopes"][0]["traces"][0]["trace_bytes"] = _trace_bytes(events)
+            with pytest.raises(privacy.PrivacyError):
+                privacy.project_publication(private, self.policy, salt=self.salt)
+
+        if phase == "policy_flags":
+            field_case_values = tuple(
+                (
+                    "allocation_net_bytes",
+                    "graph_breaks",
+                    "recompiles",
+                    "fallbacks",
+                    "host_to_device_events",
+                    "device_to_host_events",
+                )
+            )
+            assert len(field_case_values) == 6
+            field = field_case_values[field_case]
+            policy = copy.deepcopy(self.policy)
+            policy["scopes"][0]["traces"][0][field] = 1
+            with pytest.raises(privacy.PrivacyError):
+                privacy.project_publication(self.private, policy, salt=self.salt)
 
     def test_trace_rejects_unbounded_local_time(self):
         events = _trace_events()
         events[-1]["ts"] = events[1]["ts"] + privacy.MAX_LOCAL_TIMESTAMP_US + 1
-        with self.assertRaisesRegex(privacy.PrivacyError, "local-clock bound"):
+        with pytest.raises(privacy.PrivacyError, match="local-clock bound"):
             privacy.normalize_trace(_trace_bytes(events))
 
     def test_correctness_closure_tolerance_and_zero_reference_are_recomputed(self):
         private = copy.deepcopy(self.private)
         private["scopes"][0]["correctness"][0]["captures"][0]["arrays"] = []
-        with self.assertRaisesRegex(privacy.PrivacyError, "array closure"):
+        with pytest.raises(privacy.PrivacyError, match="array closure"):
             privacy.project_publication(private, self.policy, salt=self.salt)
 
         private = copy.deepcopy(self.private)
         array = private["scopes"][0]["correctness"][0]["captures"][0]["arrays"][0]
         array["candidate_bytes"] = struct.pack("<2d", 1.1, 2.0)
-        with self.assertRaisesRegex(privacy.PrivacyError, "tolerance"):
+        with pytest.raises(privacy.PrivacyError, match="tolerance"):
             privacy.project_publication(private, self.policy, salt=self.salt)
 
         private = copy.deepcopy(self.private)
         array = private["scopes"][0]["correctness"][0]["captures"][0]["arrays"][0]
         array["reference_bytes"] = struct.pack("<2d", 0.0, 0.0)
         array["candidate_bytes"] = struct.pack("<2d", 1e-12, 0.0)
-        with self.assertRaisesRegex(privacy.PrivacyError, "tolerance"):
+        with pytest.raises(privacy.PrivacyError, match="tolerance"):
             privacy.project_publication(private, self.policy, salt=self.salt)
 
     def test_private_capture_type_cannot_alias_trusted_capture(self):
         private = copy.deepcopy(self.private)
         private["scopes"][0]["correctness"][0]["captures"][0]["capture"] = "0"
-        with self.assertRaisesRegex(privacy.PrivacyError, "capture order"):
+        with pytest.raises(privacy.PrivacyError, match="capture order"):
             privacy.project_publication(private, self.policy, salt=self.salt)
 
     def test_normalized_correctness_arithmetic_is_public_and_recomputed(self):
@@ -2267,10 +2342,10 @@ class Issue123PrivacyProjectionTest(unittest.TestCase):
         arithmetic = projected["correctness_commitments"]["cases"][0]["captures"][0][
             "arrays"
         ][0]["comparison"]
-        self.assertIsNone(arithmetic["max_allowed_error"])
-        self.assertGreater(arithmetic["normalized_linf"], 0)
-        self.assertGreater(arithmetic["normalized_l2"], 0)
-        self.assertLessEqual(arithmetic["normalized_linf"], 1e-6)
+        assert arithmetic["max_allowed_error"] is None
+        assert arithmetic["normalized_linf"] > 0
+        assert arithmetic["normalized_l2"] > 0
+        assert arithmetic["normalized_linf"] <= 1e-06
 
     def test_correctness_accepts_canonical_hierarchical_array_names(self):
         policy = copy.deepcopy(self.policy)
@@ -2283,11 +2358,11 @@ class Issue123PrivacyProjectionTest(unittest.TestCase):
             "name"
         ] = public_name
         projected = privacy.project_publication(private, policy, salt=self.salt)
-        self.assertEqual(
+        assert (
             projected["correctness_commitments"]["cases"][0]["captures"][0]["arrays"][
                 0
-            ]["name"],
-            public_name,
+            ]["name"]
+            == public_name
         )
 
     def test_precollects_all_scope_identities_before_scanning_any_payload(self):
@@ -2301,7 +2376,7 @@ class Issue123PrivacyProjectionTest(unittest.TestCase):
         descriptor = policy["scopes"][0]["payloads"][0]
         descriptor["size_bytes"] = len(payload)
         descriptor["sha256"] = hashlib.sha256(payload).hexdigest()
-        with self.assertRaisesRegex(privacy.PrivacyError, "private opening"):
+        with pytest.raises(privacy.PrivacyError, match="private opening"):
             privacy.project_publication(private, policy, salt=self.salt)
 
     def test_private_identity_mapping_keys_are_scanned_before_payloads(self):
@@ -2315,33 +2390,38 @@ class Issue123PrivacyProjectionTest(unittest.TestCase):
         descriptor = policy["scopes"][0]["payloads"][0]
         descriptor["size_bytes"] = len(payload)
         descriptor["sha256"] = hashlib.sha256(payload).hexdigest()
-        with self.assertRaisesRegex(privacy.PrivacyError, "private opening"):
+        with pytest.raises(privacy.PrivacyError, match="private opening"):
             privacy.project_publication(private, policy, salt=self.salt)
 
-    def test_numeric_boolean_and_null_identity_leaves_are_scanned(self):
-        cases = (
+    @pytest.mark.parametrize(
+        ("identity", "payload"),
+        (
             (876543210123456789, b"876543210123456789"),
             (True, b"true"),
             (False, b"false"),
             (None, b"null"),
-        )
-        for identity, payload in cases:
-            with self.subTest(identity=identity):
-                policy = copy.deepcopy(self.policy)
-                private = copy.deepcopy(self.private)
-                private["scopes"][0]["identities"]["machine"] = {
-                    "opaque_identity_value": identity
-                }
-                private["scopes"][0]["payloads"][0]["bytes"] = payload
-                descriptor = policy["scopes"][0]["payloads"][0]
-                descriptor["size_bytes"] = len(payload)
-                descriptor["sha256"] = hashlib.sha256(payload).hexdigest()
-                with self.assertRaisesRegex(privacy.PrivacyError, "private opening"):
-                    privacy.project_publication(private, policy, salt=self.salt)
+        ),
+        ids=("large-integer", "true", "false", "null"),
+    )
+    def test_numeric_boolean_and_null_identity_leaves_are_scanned(
+        self, identity, payload
+    ):
+        policy = copy.deepcopy(self.policy)
+        private = copy.deepcopy(self.private)
+        private["scopes"][0]["identities"]["machine"] = {
+            "opaque_identity_value": identity
+        }
+        private["scopes"][0]["payloads"][0]["bytes"] = payload
+        descriptor = policy["scopes"][0]["payloads"][0]
+        descriptor["size_bytes"] = len(payload)
+        descriptor["sha256"] = hashlib.sha256(payload).hexdigest()
+        with pytest.raises(privacy.PrivacyError, match="private opening"):
+            privacy.project_publication(private, policy, salt=self.salt)
 
+    def test_short_numeric_identity_is_rejected_before_scanning(self):
         private = copy.deepcopy(self.private)
         private["scopes"][0]["identities"]["machine"] = {"opaque_identity_value": 7}
-        with self.assertRaisesRegex(privacy.PrivacyError, "unscannably short"):
+        with pytest.raises(privacy.PrivacyError, match="unscannably short"):
             privacy.project_publication(private, self.policy, salt=self.salt)
 
     def test_windows_drive_payload_names_fail_during_projection(self):
@@ -2350,7 +2430,7 @@ class Issue123PrivacyProjectionTest(unittest.TestCase):
         windows_name = "C:/a/_work/repo/evidence.bin"
         policy["scopes"][0]["payloads"][0]["name"] = windows_name
         private["scopes"][0]["payloads"][0]["name"] = windows_name
-        with self.assertRaisesRegex(privacy.PrivacyError, "relative"):
+        with pytest.raises(privacy.PrivacyError, match="relative"):
             privacy.project_publication(private, policy, salt=self.salt)
 
     def test_identity_values_are_bounded_and_openings_are_defensive(self):
@@ -2363,16 +2443,15 @@ class Issue123PrivacyProjectionTest(unittest.TestCase):
             "opaque_private_value"
         ] = "mutated-host"
         first = openings.identity_for_private_verification("cpu", "machine")
-        self.assertEqual(first["opaque_private_value"], "private-host-0")
+        assert first["opaque_private_value"] == "private-host-0"
         first["opaque_private_value"] = "caller-mutation"
-        self.assertEqual(
-            openings.identity_for_private_verification("cpu", "machine"),
-            {"opaque_private_value": "private-host-0"},
-        )
+        assert openings.identity_for_private_verification("cpu", "machine") == {
+            "opaque_private_value": "private-host-0"
+        }
 
         private = copy.deepcopy(self.private)
         private["scopes"][0]["identities"]["machine"]["opaque_private_value"] = "xy"
-        with self.assertRaisesRegex(privacy.PrivacyError, "short string"):
+        with pytest.raises(privacy.PrivacyError, match="short string"):
             privacy.project_publication(private, self.policy, salt=self.salt)
 
         nested = "private-host"
@@ -2380,14 +2459,14 @@ class Issue123PrivacyProjectionTest(unittest.TestCase):
             nested = [nested]
         private = copy.deepcopy(self.private)
         private["scopes"][0]["identities"]["machine"] = nested
-        with self.assertRaisesRegex(privacy.PrivacyError, "deeply nested"):
+        with pytest.raises(privacy.PrivacyError, match="deeply nested"):
             privacy.project_publication(private, self.policy, salt=self.salt)
 
     def test_failed_projection_does_not_consume_private_openings(self):
         private = copy.deepcopy(self.private)
         private["scopes"][0]["payloads"][0]["bytes"] += b"tamper"
         openings = privacy.PrivateOpenings()
-        with self.assertRaises(privacy.PrivacyError):
+        with pytest.raises(privacy.PrivacyError):
             privacy.project_publication(
                 private, self.policy, salt=self.salt, private_openings=openings
             )
@@ -2396,46 +2475,45 @@ class Issue123PrivacyProjectionTest(unittest.TestCase):
     def test_timing_count_and_exact_sample_digest_are_trusted(self):
         projected = self.project()
         timing = projected["technical_scopes"][0]["timings"][0]
-        self.assertEqual(timing["samples_sha256"], _canonical_sha256(timing["samples"]))
+        assert timing["samples_sha256"] == _canonical_sha256(timing["samples"])
 
         private = copy.deepcopy(self.private)
         private["scopes"][0]["timings"][0]["samples"].append(0.004)
-        with self.assertRaisesRegex(privacy.PrivacyError, "sample closure"):
+        with pytest.raises(privacy.PrivacyError, match="sample closure"):
             privacy.project_publication(private, self.policy, salt=self.salt)
 
         private = copy.deepcopy(self.private)
         private["scopes"][0]["timings"][0]["samples"][0] = 0.004
-        with self.assertRaisesRegex(privacy.PrivacyError, "trusted digest"):
+        with pytest.raises(privacy.PrivacyError, match="trusted digest"):
             privacy.project_publication(private, self.policy, salt=self.salt)
 
         policy = copy.deepcopy(self.policy)
         policy["scopes"][0]["timings"][0]["sample_count"] = (
             privacy.MAX_TIMING_SAMPLES + 1
         )
-        with self.assertRaisesRegex(privacy.PrivacyError, "sample count"):
+        with pytest.raises(privacy.PrivacyError, match="sample count"):
             privacy.project_publication(self.private, policy, salt=self.salt)
 
-    def test_semantic_phase_inventory_and_exact_allocations_are_trusted(self):
-        mutations = []
+    @pytest.mark.parametrize(
+        "mutation",
+        ("unknown-operation", "counter-phase", "allocation-total", "negative-copy"),
+        ids=str,
+    )
+    def test_semantic_phase_inventory_and_exact_allocations_are_trusted(self, mutation):
         events = _trace_events()
-        events[-1]["name"] = "aten::masked_scatter_"
-        mutations.append(events)
-        events = _trace_events()
-        events[1]["ph"] = "C"
-        mutations.append(events)
-        events = _trace_events()
-        events[1]["args"].update(Bytes=128, **{"Total Allocated": 128})
-        events[2]["args"].update(Bytes=-128, **{"Total Allocated": 0})
-        mutations.append(events)
-        events = _trace_events()
-        events[7]["args"]["Bytes"] = -1
-        mutations.append(events)
-        for index, events in enumerate(mutations):
-            with self.subTest(index=index):
-                private = copy.deepcopy(self.private)
-                private["scopes"][0]["traces"][0]["trace_bytes"] = _trace_bytes(events)
-                with self.assertRaises(privacy.PrivacyError):
-                    privacy.project_publication(private, self.policy, salt=self.salt)
+        if mutation == "unknown-operation":
+            events[-1]["name"] = "aten::masked_scatter_"
+        elif mutation == "counter-phase":
+            events[1]["ph"] = "C"
+        elif mutation == "allocation-total":
+            events[1]["args"].update(Bytes=128, **{"Total Allocated": 128})
+            events[2]["args"].update(Bytes=-128, **{"Total Allocated": 0})
+        else:
+            events[7]["args"]["Bytes"] = -1
+        private = copy.deepcopy(self.private)
+        private["scopes"][0]["traces"][0]["trace_bytes"] = _trace_bytes(events)
+        with pytest.raises(privacy.PrivacyError):
+            privacy.project_publication(private, self.policy, salt=self.salt)
 
     def test_trace_ordinals_bind_process_and_full_device_context(self):
         events = []
@@ -2465,12 +2543,10 @@ class Issue123PrivacyProjectionTest(unittest.TestCase):
                 }
             )
         normalized = privacy.normalize_trace(_trace_bytes(events))["events"]
-        self.assertEqual([event["thread_ordinal"] for event in normalized], [0, 1, 0])
-        self.assertEqual([event["stream_ordinal"] for event in normalized], [0, 1, 2])
-        self.assertEqual([event["graph_ordinal"] for event in normalized], [0, 1, 2])
-        self.assertEqual(
-            [event["correlation_ordinal"] for event in normalized], [0, 0, 0]
-        )
+        assert [event["thread_ordinal"] for event in normalized] == [0, 1, 0]
+        assert [event["stream_ordinal"] for event in normalized] == [0, 1, 2]
+        assert [event["graph_ordinal"] for event in normalized] == [0, 1, 2]
+        assert [event["correlation_ordinal"] for event in normalized] == [0, 0, 0]
 
     def test_allocation_context_ordinals_close_multi_device_live_totals(self):
         events = []
@@ -2500,18 +2576,22 @@ class Issue123PrivacyProjectionTest(unittest.TestCase):
                 }
             )
         trace = privacy.normalize_trace(_trace_bytes(events))
-        self.assertEqual(
-            [event["allocation_context_ordinal"] for event in trace["events"]],
-            [0, 1, 0, 1],
-        )
-        self.assertEqual(
-            [event["allocation_ordinal"] for event in trace["events"]],
-            [0, 1, 0, 1],
-        )
-        self.assertEqual(trace["summary"]["allocated_bytes"], 96)
-        self.assertEqual(trace["summary"]["freed_bytes"], 96)
-        self.assertEqual(trace["summary"]["peak_live_allocated_bytes"], 96)
-        self.assertEqual(trace["summary"]["final_live_allocated_bytes"], 0)
+        assert [event["allocation_context_ordinal"] for event in trace["events"]] == [
+            0,
+            1,
+            0,
+            1,
+        ]
+        assert [event["allocation_ordinal"] for event in trace["events"]] == [
+            0,
+            1,
+            0,
+            1,
+        ]
+        assert trace["summary"]["allocated_bytes"] == 96
+        assert trace["summary"]["freed_bytes"] == 96
+        assert trace["summary"]["peak_live_allocated_bytes"] == 96
+        assert trace["summary"]["final_live_allocated_bytes"] == 0
 
     def test_allocation_context_ordinals_distinguish_cuda_contexts(self):
         events = []
@@ -2542,18 +2622,35 @@ class Issue123PrivacyProjectionTest(unittest.TestCase):
                 }
             )
         trace = privacy.normalize_trace(_trace_bytes(events))
-        self.assertEqual(
-            [event["allocation_context_ordinal"] for event in trace["events"]],
-            [0, 1, 0, 1],
-        )
-        self.assertEqual(
-            [event["allocation_ordinal"] for event in trace["events"]],
-            [0, 1, 0, 1],
-        )
-        self.assertEqual(trace["summary"]["peak_live_allocated_bytes"], 96)
-        self.assertEqual(trace["summary"]["final_live_allocated_bytes"], 0)
+        assert [event["allocation_context_ordinal"] for event in trace["events"]] == [
+            0,
+            1,
+            0,
+            1,
+        ]
+        assert [event["allocation_ordinal"] for event in trace["events"]] == [
+            0,
+            1,
+            0,
+            1,
+        ]
+        assert trace["summary"]["peak_live_allocated_bytes"] == 96
+        assert trace["summary"]["final_live_allocated_bytes"] == 0
 
-    def test_correlation_flows_require_ids_and_complete_global_topology(self):
+    @pytest.mark.parametrize(
+        "case_phases_case",
+        range(5),
+        ids=(
+            "end-before-start",
+            "step-before-start",
+            "duplicate-start",
+            "duplicate-end",
+            "unclosed",
+        ),
+    )
+    def test_correlation_flows_require_ids_and_complete_global_topology(
+        self, case_phases_case
+    ):
         def flow(phase, correlation, timestamp):
             event = {
                 "name": "cpu-to-gpu",
@@ -2576,22 +2673,19 @@ class Issue123PrivacyProjectionTest(unittest.TestCase):
             flow("f", "first", 104),
         ]
         normalized = privacy.normalize_trace(_trace_bytes(interleaved))["events"]
-        self.assertEqual(
-            [event["correlation_ordinal"] for event in normalized],
-            [0, 1, 0, 1, 0],
-        )
+        assert [event["correlation_ordinal"] for event in normalized] == [0, 1, 0, 1, 0]
 
         equal_time = [flow("s", "same-time", 100), flow("f", "same-time", 100)]
         privacy.normalize_trace(_trace_bytes(equal_time))
 
-        with self.assertRaisesRegex(privacy.PrivacyError, "timestamps decrease"):
+        with pytest.raises(privacy.PrivacyError, match="timestamps decrease"):
             privacy.normalize_trace(
                 _trace_bytes(
                     [flow("s", "reverse-time", 200), flow("f", "reverse-time", 100)]
                 )
             )
 
-        with self.assertRaisesRegex(privacy.PrivacyError, "flow has no id"):
+        with pytest.raises(privacy.PrivacyError, match="flow has no id"):
             privacy.normalize_trace(
                 _trace_bytes([flow("s", None, 100), flow("f", "first", 101)])
             )
@@ -2603,19 +2697,20 @@ class Issue123PrivacyProjectionTest(unittest.TestCase):
             ("duplicate end", ("s", "f", "f")),
             ("unclosed", ("s", "t")),
         )
-        for case, phases in invalid_topologies:
-            with (
-                self.subTest(case=case),
-                self.assertRaisesRegex(privacy.PrivacyError, "topology is incomplete"),
-            ):
-                privacy.normalize_trace(
-                    _trace_bytes(
-                        [
-                            flow(phase, "shared", 100 + index)
-                            for index, phase in enumerate(phases)
-                        ]
-                    )
+        # The invalid topologies follow the interleaved and equal-time positive
+        # controls so the full flow state machine is tested as one sequence.
+        case_phases_case_values = tuple(invalid_topologies)
+        assert len(case_phases_case_values) == 5
+        case, phases = case_phases_case_values[case_phases_case]
+        with pytest.raises(privacy.PrivacyError, match="topology is incomplete"):
+            privacy.normalize_trace(
+                _trace_bytes(
+                    [
+                        flow(phase, "shared", 100 + index)
+                        for index, phase in enumerate(phases)
+                    ]
                 )
+            )
 
     def test_large_integer_timestamps_keep_exact_local_deltas(self):
         origin = 1 << 60
@@ -2633,7 +2728,7 @@ class Issue123PrivacyProjectionTest(unittest.TestCase):
             for index in range(2)
         ]
         normalized = privacy.normalize_trace(_trace_bytes(events))["events"]
-        self.assertEqual([event["start_us"] for event in normalized], [0.0, 1.0])
+        assert [event["start_us"] for event in normalized] == [0.0, 1.0]
 
     def test_floating_timestamp_literals_are_exact_and_bounded_before_subtraction(self):
         raw = (
@@ -2644,59 +2739,55 @@ class Issue123PrivacyProjectionTest(unittest.TestCase):
             b'"ts":1152921504606846977.0,"dur":0,"pid":1,"tid":1,"args":{}}]}'
         )
         normalized = privacy.normalize_trace(raw)["events"]
-        self.assertEqual([event["start_us"] for event in normalized], [0.0, 1.0])
+        assert [event["start_us"] for event in normalized] == [0.0, 1.0]
 
         oversized_exponent = raw.replace(b"1152921504606846976.0", b"1e999999", 1)
-        with self.assertRaisesRegex(privacy.PrivacyError, "number literal"):
+        with pytest.raises(privacy.PrivacyError, match="number literal"):
             privacy.normalize_trace(oversized_exponent)
 
-    def test_private_keys_are_redacted_from_errors_and_exception_chains(self):
+    @pytest.mark.parametrize("call_kind", ("exact-keys", "duplicate-json-key"), ids=str)
+    def test_private_keys_are_redacted_from_errors_and_exception_chains(
+        self, call_kind
+    ):
         marker = "authorization_private_probe_value"
-        calls = (
-            lambda: privacy._exact_keys(
+        if call_kind == "exact-keys":
+            call = lambda: privacy._exact_keys(
                 {marker: True}, {"expected"}, "private fixture object"
-            ),
-            lambda: privacy.normalize_trace(
+            )
+        else:
+            call = lambda: privacy.normalize_trace(
                 ("{" + json.dumps(marker) + ":1," + json.dumps(marker) + ":2}").encode(
                     "utf-8"
                 ),
                 label="private trace fixture",
-            ),
-        )
-        for call in calls:
-            with (
-                self.subTest(call=call),
-                self.assertRaises(privacy.PrivacyError) as caught,
-            ):
-                call()
-            self.assertTrue(_exception_messages(caught.exception))
-            self.assertTrue(
-                all(
-                    marker not in message
-                    for message in _exception_messages(caught.exception)
-                )
             )
+        with pytest.raises(privacy.PrivacyError) as caught:
+            call()
+        assert _exception_messages(caught.value)
+        assert all(
+            marker not in message for message in _exception_messages(caught.value)
+        )
 
     def test_metadata_clocks_and_sort_index_are_rejected(self):
         events = _trace_events()
         events[0]["ts"] = events[1]["ts"]
-        with self.assertRaisesRegex(privacy.PrivacyError, "carries a clock"):
+        with pytest.raises(privacy.PrivacyError, match="carries a clock"):
             privacy.normalize_trace(_trace_bytes(events))
 
         events = _trace_events()
         events[0]["name"] = "process_sort_index"
         events[0]["args"] = {"sort_index": "first"}
-        with self.assertRaisesRegex(privacy.PrivacyError, "sort index"):
+        with pytest.raises(privacy.PrivacyError, match="sort index"):
             privacy.normalize_trace(_trace_bytes(events))
 
     def test_correctness_arithmetic_closes_elementwise_extrema_and_empty_arrays(self):
         comparison = self.project()["correctness_commitments"]["cases"][0]["captures"][
             0
         ]["arrays"][0]["comparison"]
-        self.assertEqual(comparison["reference_abs_max"], 2.0)
-        self.assertAlmostEqual(comparison["reference_l2"], math.sqrt(5.0))
-        self.assertAlmostEqual(comparison["error_l2"], comparison["max_abs_error"])
-        self.assertLessEqual(comparison["max_tolerance_excess"], 0)
+        assert comparison["reference_abs_max"] == 2.0
+        assert round(comparison["reference_l2"] - math.sqrt(5.0), 7) == 0
+        assert round(comparison["error_l2"] - comparison["max_abs_error"], 7) == 0
+        assert comparison["max_tolerance_excess"] <= 0
 
         policy = copy.deepcopy(self.policy)
         private = copy.deepcopy(self.private)
@@ -2705,7 +2796,7 @@ class Issue123PrivacyProjectionTest(unittest.TestCase):
         array = private["scopes"][0]["correctness"][0]["captures"][0]["arrays"][0]
         array["reference_bytes"] = struct.pack("<2d", 1000.0, 0.0)
         array["candidate_bytes"] = struct.pack("<2d", 1000.0, 0.001)
-        with self.assertRaisesRegex(privacy.PrivacyError, "tolerance"):
+        with pytest.raises(privacy.PrivacyError, match="tolerance"):
             privacy.project_publication(private, policy, salt=self.salt)
 
         policy = copy.deepcopy(self.policy)
@@ -2716,7 +2807,7 @@ class Issue123PrivacyProjectionTest(unittest.TestCase):
         array["shape"] = [0]
         array["reference_bytes"] = b""
         array["candidate_bytes"] = b""
-        with self.assertRaisesRegex(privacy.PrivacyError, "contain an element"):
+        with pytest.raises(privacy.PrivacyError, match="contain an element"):
             privacy.project_publication(private, policy, salt=self.salt)
 
         policy = copy.deepcopy(self.policy)
@@ -2727,7 +2818,7 @@ class Issue123PrivacyProjectionTest(unittest.TestCase):
         array["shape"] = [True]
         array["reference_bytes"] = struct.pack("<d", 1.0)
         array["candidate_bytes"] = struct.pack("<d", 1.0)
-        with self.assertRaisesRegex(privacy.PrivacyError, "shape"):
+        with pytest.raises(privacy.PrivacyError, match="shape"):
             privacy.project_publication(private, policy, salt=self.salt)
 
     def test_operations_v2_job_names_order_and_workflow_pairing_are_exact(self):
@@ -2738,18 +2829,18 @@ class Issue123PrivacyProjectionTest(unittest.TestCase):
             policy["bindings"]["jobs"][0],
         )
         private["bindings"] = copy.deepcopy(policy["bindings"])
-        with self.assertRaisesRegex(privacy.PrivacyError, "job order"):
+        with pytest.raises(privacy.PrivacyError, match="job order"):
             privacy.project_publication(private, policy, salt=self.salt)
 
         policy = copy.deepcopy(self.policy)
         private = copy.deepcopy(self.private)
         policy["bindings"]["jobs"][1]["run_attempt"] += 1
         private["bindings"] = copy.deepcopy(policy["bindings"])
-        with self.assertRaisesRegex(privacy.PrivacyError, "attempts differ"):
+        with pytest.raises(privacy.PrivacyError, match="attempts differ"):
             privacy.project_publication(private, policy, salt=self.salt)
 
 
-class Issue123PrivacyScannerTest(unittest.TestCase):
+class TestIssue123PrivacyScanner:
     def _private_sdist(self, *, pax_items=(), uname="builder", gname="builders"):
         info = tarfile.TarInfo("gmes-0.10.0/package/data.py")
         info.uid = 42
@@ -2786,7 +2877,42 @@ class Issue123PrivacyScannerTest(unittest.TestCase):
             finally:
                 os.close(fd)
 
-    def test_private_sdist_descriptor_raw_first_owner_contract(self):
+    @pytest.mark.parametrize(
+        "source_label_source_case",
+        range(27),
+        ids=(
+            "forged-index",
+            "bool-fd",
+            "int-subclass",
+            "bool-identity-field",
+            "missing-identity-field",
+            "negative-fd",
+            "negative-device",
+            "negative-inode",
+            "directory-mode",
+            "zero-nlink",
+            "negative-size",
+            "negative-mtime",
+            "timestamp-overflow",
+            "bool-device",
+            "int-subclass-device",
+            "bool-inode",
+            "int-subclass-inode",
+            "bool-mode",
+            "int-subclass-mode",
+            "bool-nlink",
+            "int-subclass-nlink",
+            "bool-size",
+            "int-subclass-size",
+            "bool-mtime_ns",
+            "int-subclass-mtime_ns",
+            "bool-ctime_ns",
+            "int-subclass-ctime_ns",
+        ),
+    )
+    def test_private_sdist_descriptor_raw_first_owner_contract(
+        self, source_label_source_case
+    ):
         raw = self._private_sdist(
             pax_items=(
                 ("uid", "43"),
@@ -2807,44 +2933,42 @@ class Issue123PrivacyScannerTest(unittest.TestCase):
         ):
             started = time.monotonic()
             result = self._validate_private_sdist(raw)
-        self.assertLess(time.monotonic() - started, 5.0)
+        assert time.monotonic() - started < 5.0
         rebuilt.assert_not_called()
-        self.assertEqual(result.archive_size, len(raw))
-        self.assertEqual(result.archive_sha256, hashlib.sha256(raw).hexdigest())
-        self.assertEqual(result.physical_ordinary_count, 1)
-        self.assertEqual(result.logical_member_count, 1)
-        self.assertEqual(result.total_member_bytes, len(b"value = 1\n"))
-        self.assertEqual(len(result.members), 1)
+        assert result.archive_size == len(raw)
+        assert result.archive_sha256 == hashlib.sha256(raw).hexdigest()
+        assert result.physical_ordinary_count == 1
+        assert result.logical_member_count == 1
+        assert result.total_member_bytes == len(b"value = 1\n")
+        assert len(result.members) == 1
         member = result.members[0]
-        self.assertEqual(member.name, "gmes-0.10.0/package/data.py")
-        self.assertEqual(member.type_code, "file")
-        self.assertEqual(member.size, len(b"value = 1\n"))
-        self.assertGreaterEqual(member.body_offset, 512)
-        self.assertEqual(member.sha256, hashlib.sha256(b"value = 1\n").hexdigest())
-        self.assertFalse(any("owner" in field for field in result.__dataclass_fields__))
-        with self.assertRaises(privacy.PrivacyError):
+        assert member.name == "gmes-0.10.0/package/data.py"
+        assert member.type_code == "file"
+        assert member.size == len(b"value = 1\n")
+        assert member.body_offset >= 512
+        assert member.sha256 == hashlib.sha256(b"value = 1\n").hexdigest()
+        assert not (any(("owner" in field for field in result.__dataclass_fields__)))
+        with pytest.raises(privacy.PrivacyError):
             privacy.scan_payload("packages/public.tar.gz", raw)
 
         marker = "private-owner-opening"
-        with self.assertRaises(privacy._PrivateSdistValidationError) as caught:
+        with pytest.raises(privacy._PrivateSdistValidationError) as caught:
             self._validate_private_sdist(
                 self._private_sdist(uname=marker), openings=(marker,)
             )
-        self.assertEqual(
-            str(caught.exception), privacy._PrivateSdistFailure.ARCHIVE_REJECTED.value
-        )
-        self.assertIsNone(caught.exception.__cause__)
-        self.assertIsNone(caught.exception.__context__)
-        self.assertNotIn(marker, " ".join(_exception_messages(caught.exception)))
+        assert str(caught.value) == privacy._PrivateSdistFailure.ARCHIVE_REJECTED.value
+        assert caught.value.__cause__ is None
+        assert caught.value.__context__ is None
+        assert marker not in " ".join(_exception_messages(caught.value))
 
-        with self.assertRaises(privacy._PrivateSdistValidationError) as fabricated:
+        with pytest.raises(privacy._PrivateSdistValidationError) as fabricated:
             privacy._validate_private_sdist_raw_first(
                 privacy._PrivateSdistReadView(0, object(), object()),
                 (),
                 limits=privacy._default_private_sdist_validation_limits(),
             )
-        self.assertEqual(
-            str(fabricated.exception), privacy._PrivateSdistFailure.SOURCE_INVALID.value
+        assert (
+            str(fabricated.value) == privacy._PrivateSdistFailure.SOURCE_INVALID.value
         )
 
         marker = "forged-private-sdist-fd"
@@ -2982,38 +3106,36 @@ class Issue123PrivacyScannerTest(unittest.TestCase):
         with mock.patch.object(
             privacy.os, "fstat", side_effect=AssertionError("fstat reached")
         ) as fstat:
-            for source_label, source in forged_sources:
-                with self.subTest(source_type=source_label):
-                    with self.assertRaises(
-                        privacy._PrivateSdistValidationError
-                    ) as caught:
-                        privacy._validate_private_sdist_raw_first(
-                            source,
-                            (),
-                            limits=privacy._default_private_sdist_validation_limits(),
+            source_label_source_case_values = tuple(forged_sources)
+            assert len(source_label_source_case_values) == 27
+            source_label, source = source_label_source_case_values[
+                source_label_source_case
+            ]
+            with pytest.raises(privacy._PrivateSdistValidationError) as caught:
+                privacy._validate_private_sdist_raw_first(
+                    source,
+                    (),
+                    limits=privacy._default_private_sdist_validation_limits(),
+                )
+            error = caught.value
+            assert type(error) is privacy._PrivateSdistValidationError
+            assert error.args == (privacy._PrivateSdistFailure.SOURCE_INVALID.value,)
+            assert error.__cause__ is None
+            assert error.__context__ is None
+            diagnostics = " ".join(
+                (
+                    str(error),
+                    repr(error),
+                    repr(error.args),
+                    repr(getattr(error, "__notes__", ())),
+                    "".join(
+                        traceback.format_exception(
+                            type(error), error, error.__traceback__
                         )
-                    error = caught.exception
-                    self.assertIs(type(error), privacy._PrivateSdistValidationError)
-                    self.assertEqual(
-                        error.args,
-                        (privacy._PrivateSdistFailure.SOURCE_INVALID.value,),
-                    )
-                    self.assertIsNone(error.__cause__)
-                    self.assertIsNone(error.__context__)
-                    diagnostics = " ".join(
-                        (
-                            str(error),
-                            repr(error),
-                            repr(error.args),
-                            repr(getattr(error, "__notes__", ())),
-                            "".join(
-                                traceback.format_exception(
-                                    type(error), error, error.__traceback__
-                                )
-                            ),
-                        )
-                    )
-                    self.assertNotIn(marker, diagnostics)
+                    ),
+                )
+            )
+            assert marker not in diagnostics
         fstat.assert_not_called()
 
         defaults = privacy._default_private_sdist_validation_limits()
@@ -3028,7 +3150,7 @@ class Issue123PrivacyScannerTest(unittest.TestCase):
                 "_scan_tar",
                 side_effect=AssertionError("tar scan entered"),
             ) as tar_scan,
-            self.assertRaises(privacy._PrivateSdistValidationError) as caught,
+            pytest.raises(privacy._PrivateSdistValidationError) as caught,
         ):
             self._validate_private_sdist(
                 raw,
@@ -3036,9 +3158,7 @@ class Issue123PrivacyScannerTest(unittest.TestCase):
                 limits=privacy._PrivateSdistValidationLimits(**limited_values),
             )
         tar_scan.assert_not_called()
-        self.assertEqual(
-            str(caught.exception), privacy._PrivateSdistFailure.ARCHIVE_REJECTED.value
-        )
+        assert str(caught.value) == privacy._PrivateSdistFailure.ARCHIVE_REJECTED.value
 
         limited_values["matcher_states"] = defaults.matcher_states
         limited_values["normalization_work_bytes"] = 1
@@ -3048,18 +3168,19 @@ class Issue123PrivacyScannerTest(unittest.TestCase):
                 "open",
                 side_effect=AssertionError("logical tar entered"),
             ) as logical_open,
-            self.assertRaises(privacy._PrivateSdistValidationError) as caught,
+            pytest.raises(privacy._PrivateSdistValidationError) as caught,
         ):
             self._validate_private_sdist(
                 raw,
                 limits=privacy._PrivateSdistValidationLimits(**limited_values),
             )
         logical_open.assert_not_called()
-        self.assertEqual(
-            str(caught.exception), privacy._PrivateSdistFailure.ARCHIVE_REJECTED.value
-        )
+        assert str(caught.value) == privacy._PrivateSdistFailure.ARCHIVE_REJECTED.value
 
-    def test_full_normalization_tail_boundary_lookahead(self):
+    @pytest.mark.parametrize(
+        "encoding_value_case", range(3), ids=("utf8", "utf16-le", "utf16-be")
+    )
+    def test_full_normalization_tail_boundary_lookahead(self, encoding_value_case):
         tail = "\N{COMBINING ACUTE ACCENT}" * 8
         encodings = (
             ("utf-8", tail + "AA"),
@@ -3071,19 +3192,20 @@ class Issue123PrivacyScannerTest(unittest.TestCase):
             mock.patch.object(privacy, "MAX_PRIVACY_NORMALIZATION_TAIL_BYTES", 32),
             mock.patch.object(privacy, "PRIVACY_TEXT_INPUT_CHUNK_BYTES", 2),
         ):
-            for encoding, value in encodings:
-                with self.subTest(encoding=encoding):
-                    context = privacy._privacy_scan_context(())
-                    privacy._scan_decoded_privacy_view(
-                        value.encode(encoding),
-                        encoding,
-                        0,
-                        "tail boundary",
-                        context,
-                        check_patterns=True,
-                        check_openings=True,
-                    )
-            with self.assertRaisesRegex(privacy.PrivacyError, "normalization exceeds"):
+            encoding_value_case_values = tuple(encodings)
+            assert len(encoding_value_case_values) == 3
+            encoding, value = encoding_value_case_values[encoding_value_case]
+            context = privacy._privacy_scan_context(())
+            privacy._scan_decoded_privacy_view(
+                value.encode(encoding),
+                encoding,
+                0,
+                "tail boundary",
+                context,
+                check_patterns=True,
+                check_openings=True,
+            )
+            with pytest.raises(privacy.PrivacyError, match="normalization exceeds"):
                 privacy._scan_decoded_privacy_view(
                     (tail + "A\N{COMBINING ACUTE ACCENT}").encode(),
                     "utf-8",
@@ -3094,49 +3216,97 @@ class Issue123PrivacyScannerTest(unittest.TestCase):
                     check_openings=True,
                 )
 
-    def test_utf8_surrogate_failures_are_chain_free(self):
+    @pytest.mark.parametrize(
+        "value_case",
+        range(3),
+        ids=("high-surrogate", "embedded-low-surrogate", "low-surrogate"),
+    )
+    def test_utf8_surrogate_failures_are_chain_free(self, value_case):
+        self._check_utf8_surrogate_failures_are_chain_free_phase(
+            phase="surrogates", value_case=value_case
+        )
+
+    @pytest.mark.parametrize(
+        "name_raw_media_type_case", range(4), ids=("opaque", "zip", "tar", "gzip")
+    )
+    def test_utf8_surrogate_failures_are_chain_free_payload_carriers(
+        self, name_raw_media_type_case
+    ):
+        self._check_utf8_surrogate_failures_are_chain_free_phase(
+            phase="payload_carriers", name_raw_media_type_case=name_raw_media_type_case
+        )
+
+    def _check_utf8_surrogate_failures_are_chain_free_phase(
+        self, *, phase, value_case=None, name_raw_media_type_case=None
+    ):
         marker = "private-surrogate-marker"
-        for value in ("\ud800", "x\udc00", "\udfff"):
-            with (
-                self.subTest(value=repr(value)),
-                self.assertRaises(privacy.PrivacyError) as caught,
-            ):
+        # Every malformed scalar and carrier shares the same chain-free,
+        # non-leaking error contract; keep this as one full carrier inventory.
+        if phase == "surrogates":
+            value_case_values = tuple(("\ud800", "x\udc00", "\udfff"))
+            assert len(value_case_values) == 3
+            value = value_case_values[value_case]
+            with pytest.raises(privacy.PrivacyError) as caught:
                 privacy._utf8_bytes(value, "JSON string value")
-            _assert_sanitized_privacy_error(self, caught.exception, marker)
+            _assert_sanitized_privacy_error(caught.value, marker)
 
-        escaped = json.dumps({marker: "\ud800"})
-        for name, raw, media_type in (
-            ("packages/value.bin", escaped.encode(), "application/octet-stream"),
-            (
-                "packages/value.zip",
-                _zip_bytes((("package/config.json", escaped.encode()),)),
-                "application/zip",
-            ),
-            (
-                "packages/value.tar",
-                _physical_tar_bytes(
-                    [_ordinary_tar_record("package/config.json", escaped.encode())]
-                ),
-                "application/x-tar",
-            ),
-            (
-                "packages/value.tar.gz",
-                _gzip_bytes(
-                    _physical_tar_bytes(
-                        [_ordinary_tar_record("package/config.json", escaped.encode())]
-                    )
-                ),
-                "application/gzip",
-            ),
-        ):
-            with (
-                self.subTest(name=name),
-                self.assertRaises(privacy.PrivacyError) as caught,
-            ):
+        if phase == "payload_carriers":
+            escaped = json.dumps({marker: "\ud800"})
+            name_raw_media_type_case_values = tuple(
+                (
+                    (
+                        "packages/value.bin",
+                        escaped.encode(),
+                        "application/octet-stream",
+                    ),
+                    (
+                        "packages/value.zip",
+                        _zip_bytes((("package/config.json", escaped.encode()),)),
+                        "application/zip",
+                    ),
+                    (
+                        "packages/value.tar",
+                        _physical_tar_bytes(
+                            [
+                                _ordinary_tar_record(
+                                    "package/config.json", escaped.encode()
+                                )
+                            ]
+                        ),
+                        "application/x-tar",
+                    ),
+                    (
+                        "packages/value.tar.gz",
+                        _gzip_bytes(
+                            _physical_tar_bytes(
+                                [
+                                    _ordinary_tar_record(
+                                        "package/config.json", escaped.encode()
+                                    )
+                                ]
+                            )
+                        ),
+                        "application/gzip",
+                    ),
+                )
+            )
+            assert len(name_raw_media_type_case_values) == 4
+            name, raw, media_type = name_raw_media_type_case_values[
+                name_raw_media_type_case
+            ]
+            with pytest.raises(privacy.PrivacyError) as caught:
                 privacy.scan_payload(name, raw, media_type=media_type)
-            _assert_sanitized_privacy_error(self, caught.exception, marker)
+            _assert_sanitized_privacy_error(caught.value, marker)
 
-    def test_decoded_json_keys_use_shared_privacy_context(self):
+    @pytest.mark.parametrize(
+        "name_payload_media_type_case", range(4), ids=("opaque", "zip", "tar", "gzip")
+    )
+    @pytest.mark.parametrize(
+        "document_case", range(2), ids=("opening-key", "nested-host-key")
+    )
+    def test_decoded_json_keys_use_shared_privacy_context(
+        self, name_payload_media_type_case, document_case
+    ):
         def escaped(value):
             return "".join(f"\\u{ord(character):04x}" for character in value)
 
@@ -3145,43 +3315,44 @@ class Issue123PrivacyScannerTest(unittest.TestCase):
             "{" + json.dumps(escaped(opening)) + ':"safe"}',
             '{"nested": {' + json.dumps(escaped("HOST=synthetic-node")) + ':"safe"}}',
         )
-        for document in documents:
-            raw = document.encode()
-            carriers = (
-                ("packages/keys.bin", raw, "application/octet-stream"),
-                (
-                    "packages/keys.zip",
-                    _zip_bytes((("package/config.json", raw),)),
-                    "application/zip",
-                ),
-                (
-                    "packages/keys.tar",
+        document_case_values = tuple(documents)
+        assert len(document_case_values) == 2
+        document = document_case_values[document_case]
+        raw = document.encode()
+        carriers = (
+            ("packages/keys.bin", raw, "application/octet-stream"),
+            (
+                "packages/keys.zip",
+                _zip_bytes((("package/config.json", raw),)),
+                "application/zip",
+            ),
+            (
+                "packages/keys.tar",
+                _physical_tar_bytes([_ordinary_tar_record("package/config.json", raw)]),
+                "application/x-tar",
+            ),
+            (
+                "packages/keys.tar.gz",
+                _gzip_bytes(
                     _physical_tar_bytes(
                         [_ordinary_tar_record("package/config.json", raw)]
-                    ),
-                    "application/x-tar",
-                ),
-                (
-                    "packages/keys.tar.gz",
-                    _gzip_bytes(
-                        _physical_tar_bytes(
-                            [_ordinary_tar_record("package/config.json", raw)]
-                        )
-                    ),
-                    "application/gzip",
-                ),
-            )
-            for name, payload, media_type in carriers:
-                with (
-                    self.subTest(document=document, name=name),
-                    self.assertRaises(privacy.PrivacyError),
-                ):
-                    privacy.scan_payload(
-                        name,
-                        payload,
-                        media_type=media_type,
-                        forbidden_values=(opening,),
                     )
+                ),
+                "application/gzip",
+            ),
+        )
+        name_payload_media_type_case_values = tuple(carriers)
+        assert len(name_payload_media_type_case_values) == 4
+        name, payload, media_type = name_payload_media_type_case_values[
+            name_payload_media_type_case
+        ]
+        with pytest.raises(privacy.PrivacyError):
+            privacy.scan_payload(
+                name,
+                payload,
+                media_type=media_type,
+                forbidden_values=(opening,),
+            )
 
         safe = b'{"nested":{"public_key":"safe"}}'
         prepared = privacy._prepare_forbidden_value_plan
@@ -3191,7 +3362,7 @@ class Issue123PrivacyScannerTest(unittest.TestCase):
             privacy.scan_payload(
                 "packages/safe.bin", safe, forbidden_values=("absent-opening",)
             )
-        self.assertEqual(plan.call_count, 1)
+        assert plan.call_count == 1
 
     def test_pax_resident_ownership_is_preflighted(self):
         helper_body = _pax_record("comment", "q" * (64 * 1024 - 32))
@@ -3240,35 +3411,36 @@ class Issue123PrivacyScannerTest(unittest.TestCase):
         ):
             privacy.scan_payload("packages/pax.tar.gz", compressed)
             privacy.scan_payload("packages/pax.tar", raw)
-        self.assertTrue(reader_inputs)
-        self.assertTrue(all(type(source) is bytes for source in reader_inputs))
+        assert reader_inputs
+        assert all((type(source) is bytes for source in reader_inputs))
         state = resource_states[0]
-        self.assertIsNotNone(state)
-        self.assertEqual(state.physical_helper_bytes, helper_size)
-        self.assertEqual(state.logical_reparse_bytes, helper_size)
-        self.assertEqual(state.logical_reparse_peak_read_bytes, helper_size)
-        self.assertEqual(state.logical_reparse_raw_bytes, 3 * helper_size)
-        self.assertEqual(state.logical_reparse_decoded_bytes, 4 * helper_size)
-        self.assertEqual(state.logical_reparse_record_object_bytes, 512)
-        self.assertEqual(state.association_references, 1)
-        self.assertEqual(state.association_members, 1)
-        self.assertEqual(
-            state.physical_association_bytes,
-            privacy._PAX_PHYSICAL_ASSOCIATION_RESERVE_BYTES,
+        assert state is not None
+        assert state.physical_helper_bytes == helper_size
+        assert state.logical_reparse_bytes == helper_size
+        assert state.logical_reparse_peak_read_bytes == helper_size
+        assert state.logical_reparse_raw_bytes == 3 * helper_size
+        assert state.logical_reparse_decoded_bytes == 4 * helper_size
+        assert state.logical_reparse_record_object_bytes == 512
+        assert state.association_references == 1
+        assert state.association_members == 1
+        assert (
+            state.physical_association_bytes
+            == privacy._PAX_PHYSICAL_ASSOCIATION_RESERVE_BYTES
         )
-        self.assertEqual(
-            state.logical_cached_association_bytes,
-            privacy._PAX_LOGICAL_ASSOCIATION_RESERVE_BYTES,
+        assert (
+            state.logical_cached_association_bytes
+            == privacy._PAX_LOGICAL_ASSOCIATION_RESERVE_BYTES
         )
-        self.assertEqual(state.current_same_value_owners, 8)
-        self.assertLessEqual(
-            state.resident_bytes(), reserve - pax_limits["MAX_TAR_SCAN_TRANSIENT_BYTES"]
+        assert state.current_same_value_owners == 8
+        assert (
+            state.resident_bytes()
+            <= reserve - pax_limits["MAX_TAR_SCAN_TRANSIENT_BYTES"]
         )
 
         reader = privacy._TarBufferReader(b"immutable")
-        self.assertIs(type(reader._raw), bytes)
-        self.assertNotIsInstance(reader._raw, memoryview)
-        with self.assertRaises(TypeError):
+        assert type(reader._raw) is bytes
+        assert not isinstance(reader._raw, memoryview)
+        with pytest.raises(TypeError):
             privacy._TarBufferReader(bytearray(b"mutable"))
 
         with (
@@ -3281,7 +3453,7 @@ class Issue123PrivacyScannerTest(unittest.TestCase):
                 "_scan_tar_physical_records",
                 side_effect=AssertionError("physical scan entered"),
             ) as physical_scan,
-            self.assertRaisesRegex(privacy.PrivacyError, "resident-memory bound"),
+            pytest.raises(privacy.PrivacyError, match="resident-memory bound"),
         ):
             privacy.scan_payload("packages/pax.tar", raw)
         physical_scan.assert_not_called()
@@ -3295,7 +3467,7 @@ class Issue123PrivacyScannerTest(unittest.TestCase):
                 },
             ),
             mock.patch.object(privacy, "_allocate_tar_buffer") as allocate,
-            self.assertRaisesRegex(privacy.PrivacyError, "oversized"),
+            pytest.raises(privacy.PrivacyError, match="oversized"),
         ):
             privacy.scan_payload("packages/pax.tar.gz", compressed)
         allocate.assert_not_called()
@@ -3358,25 +3530,25 @@ class Issue123PrivacyScannerTest(unittest.TestCase):
         ):
             privacy.scan_payload("packages/global-pax.tar", association_raw)
         association_state = association_states[0]
-        self.assertEqual(
-            association_state.association_references, association_references
+        assert association_state.association_references == association_references
+        assert association_state.association_members == association_members
+        assert (
+            association_state.physical_association_bytes
+            == privacy._PAX_PHYSICAL_ASSOCIATION_RESERVE_BYTES * association_references
         )
-        self.assertEqual(association_state.association_members, association_members)
-        self.assertEqual(
-            association_state.physical_association_bytes,
-            privacy._PAX_PHYSICAL_ASSOCIATION_RESERVE_BYTES * association_references,
+        assert (
+            association_state.physical_associated_member_bytes
+            == privacy._PAX_PHYSICAL_ASSOCIATED_MEMBER_RESERVE_BYTES
+            * association_members
         )
-        self.assertEqual(
-            association_state.physical_associated_member_bytes,
-            privacy._PAX_PHYSICAL_ASSOCIATED_MEMBER_RESERVE_BYTES * association_members,
+        assert (
+            association_state.logical_cached_association_bytes
+            == privacy._PAX_LOGICAL_ASSOCIATION_RESERVE_BYTES * association_references
         )
-        self.assertEqual(
-            association_state.logical_cached_association_bytes,
-            privacy._PAX_LOGICAL_ASSOCIATION_RESERVE_BYTES * association_references,
-        )
-        self.assertEqual(
-            association_state.logical_cached_member_bytes,
-            privacy._PAX_LOGICAL_ASSOCIATED_MEMBER_RESERVE_BYTES * association_members,
+        assert (
+            association_state.logical_cached_member_bytes
+            == privacy._PAX_LOGICAL_ASSOCIATED_MEMBER_RESERVE_BYTES
+            * association_members
         )
         with (
             mock.patch.multiple(
@@ -3393,12 +3565,62 @@ class Issue123PrivacyScannerTest(unittest.TestCase):
                 "_scan_tar_physical_records",
                 side_effect=AssertionError("physical scan entered"),
             ) as physical_scan,
-            self.assertRaisesRegex(privacy.PrivacyError, "resident-memory bound"),
+            pytest.raises(privacy.PrivacyError, match="resident-memory bound"),
         ):
             privacy.scan_payload("packages/global-pax.tar", association_raw)
         physical_scan.assert_not_called()
 
-    def test_forbidden_openings_are_normalized_across_payload_encodings(self):
+    @pytest.mark.parametrize(
+        "index_raw_case",
+        range(7),
+        ids=(
+            "utf8",
+            "utf16-le",
+            "utf16-be",
+            "utf16-le-bom",
+            "utf16-be-bom",
+            "utf16-le-offset",
+            "utf16-be-offset",
+        ),
+    )
+    def test_forbidden_openings_are_normalized_across_payload_encodings(
+        self, index_raw_case
+    ):
+        self._check_forbidden_openings_are_normalized_across_payload_encodings_phase(
+            phase="public_bytes", index_raw_case=index_raw_case
+        )
+
+    @pytest.mark.parametrize(
+        "index_raw_case",
+        range(7),
+        ids=(
+            "utf8",
+            "utf16-le",
+            "utf16-be",
+            "utf16-le-bom",
+            "utf16-be-bom",
+            "utf16-le-offset",
+            "utf16-be-offset",
+        ),
+    )
+    def test_forbidden_openings_are_normalized_across_payload_encodings_payload_bytes(
+        self, index_raw_case
+    ):
+        self._check_forbidden_openings_are_normalized_across_payload_encodings_phase(
+            phase="payload_bytes", index_raw_case=index_raw_case
+        )
+
+    @pytest.mark.parametrize("suffix_raw_case", range(3), ids=("tar", "gzip", "pax"))
+    def test_forbidden_openings_are_normalized_across_payload_encodings_tar_carriers(
+        self, suffix_raw_case
+    ):
+        self._check_forbidden_openings_are_normalized_across_payload_encodings_phase(
+            phase="tar_carriers", suffix_raw_case=suffix_raw_case
+        )
+
+    def _check_forbidden_openings_are_normalized_across_payload_encodings_phase(
+        self, *, phase, index_raw_case=None, suffix_raw_case=None
+    ):
         opening = "Straße-Private-Opening"
         normalized = _fullwidth_ascii("STRASSE-PRIVATE-OPENING")
         encoded_variants = (
@@ -3410,16 +3632,15 @@ class Issue123PrivacyScannerTest(unittest.TestCase):
             b"x" + normalized.encode("utf-16-le"),
             b"x" + normalized.encode("utf-16-be"),
         )
-        for index, raw in enumerate(encoded_variants):
-            with (
-                self.subTest(container="direct", index=index),
-                self.assertRaisesRegex(privacy.PrivacyError, "private opening"),
-            ):
+        if phase in ("public_bytes", "payload_bytes"):
+            index_raw_case_values = tuple(enumerate(encoded_variants))
+            assert len(index_raw_case_values) == 7
+            index, raw = index_raw_case_values[index_raw_case]
+        if phase == "public_bytes":
+            with pytest.raises(privacy.PrivacyError, match="private opening"):
                 privacy.scan_public_bytes(raw, forbidden_values=(opening,))
-            with (
-                self.subTest(container="opaque", index=index),
-                self.assertRaisesRegex(privacy.PrivacyError, "private opening"),
-            ):
+        if phase == "payload_bytes":
+            with pytest.raises(privacy.PrivacyError, match="private opening"):
                 privacy.scan_payload(
                     f"packages/normalized-{index}.bin",
                     raw,
@@ -3427,37 +3648,45 @@ class Issue123PrivacyScannerTest(unittest.TestCase):
                     forbidden_values=(opening,),
                 )
 
-        for suffix, raw in (
-            (
-                "tar",
-                _physical_tar_bytes([_ordinary_tar_record(body=encoded_variants[0])]),
-            ),
-            (
-                "tar.gz",
-                _gzip_bytes(
-                    _physical_tar_bytes(
-                        [_ordinary_tar_record(body=encoded_variants[2])]
-                    )
-                ),
-            ),
-            (
-                "pax.tar",
-                _physical_tar_bytes(
-                    [
-                        _pax_helper(tarfile.XHDTYPE, (("comment", normalized),)),
-                        _ordinary_tar_record(),
-                    ]
-                ),
-            ),
-        ):
+        if phase == "tar_carriers":
+            suffix_raw_case_values = tuple(
+                (
+                    (
+                        "tar",
+                        _physical_tar_bytes(
+                            [_ordinary_tar_record(body=encoded_variants[0])]
+                        ),
+                    ),
+                    (
+                        "tar.gz",
+                        _gzip_bytes(
+                            _physical_tar_bytes(
+                                [_ordinary_tar_record(body=encoded_variants[2])]
+                            )
+                        ),
+                    ),
+                    (
+                        "pax.tar",
+                        _physical_tar_bytes(
+                            [
+                                _pax_helper(
+                                    tarfile.XHDTYPE, (("comment", normalized),)
+                                ),
+                                _ordinary_tar_record(),
+                            ]
+                        ),
+                    ),
+                )
+            )
+            assert len(suffix_raw_case_values) == 3
+            suffix, raw = suffix_raw_case_values[suffix_raw_case]
             with (
-                self.subTest(container=suffix),
                 mock.patch.object(
                     privacy.tarfile,
                     "open",
                     side_effect=AssertionError("logical parser entered"),
                 ) as opened,
-                self.assertRaisesRegex(privacy.PrivacyError, "private opening"),
+                pytest.raises(privacy.PrivacyError, match="private opening"),
             ):
                 privacy.scan_payload(
                     f"packages/normalized.{suffix}",
@@ -3466,7 +3695,22 @@ class Issue123PrivacyScannerTest(unittest.TestCase):
                 )
             opened.assert_not_called()
 
-    def test_unicode_stream_scans_are_stateful_and_malformed_units_separate(self):
+    @pytest.mark.parametrize(
+        "index_raw_case",
+        range(7),
+        ids=(
+            "utf8",
+            "utf16-le",
+            "utf16-be",
+            "utf16-le-bom",
+            "utf16-be-bom",
+            "utf16-le-offset",
+            "utf16-be-offset",
+        ),
+    )
+    def test_unicode_stream_scans_are_stateful_and_malformed_units_separate(
+        self, index_raw_case
+    ):
         opening = "Probe\N{GRINNING FACE}Opening"
         rendered = "PROBE\N{GRINNING FACE}OPENING"
         variants = (
@@ -3479,12 +3723,11 @@ class Issue123PrivacyScannerTest(unittest.TestCase):
             b"x" + rendered.encode("utf-16-be"),
         )
         with mock.patch.object(privacy, "PRIVACY_TEXT_INPUT_CHUNK_BYTES", 5):
-            for index, raw in enumerate(variants):
-                with (
-                    self.subTest(index=index),
-                    self.assertRaisesRegex(privacy.PrivacyError, "private opening"),
-                ):
-                    privacy.scan_public_bytes(raw, forbidden_values=(opening,))
+            index_raw_case_values = tuple(enumerate(variants))
+            assert len(index_raw_case_values) == 7
+            index, raw = index_raw_case_values[index_raw_case]
+            with pytest.raises(privacy.PrivacyError, match="private opening"):
+                privacy.scan_public_bytes(raw, forbidden_values=(opening,))
 
             malformed = (
                 "Probe".encode("utf-16-le")
@@ -3499,7 +3742,7 @@ class Issue123PrivacyScannerTest(unittest.TestCase):
                 b"Probe\xffOpening",
                 forbidden_values=("Probe\N{REPLACEMENT CHARACTER}Opening",),
             )
-            with self.assertRaises(privacy.PrivacyError):
+            with pytest.raises(privacy.PrivacyError):
                 privacy.scan_public_bytes(
                     b"\xff" + _fullwidth_ascii("HOST=synthetic-node").encode("utf-8")
                 )
@@ -3512,12 +3755,59 @@ class Issue123PrivacyScannerTest(unittest.TestCase):
             mock.patch.object(privacy, "MAX_PRIVACY_NORMALIZATION_TAIL_BYTES", 64),
         ):
             privacy.scan_public_bytes(("x" + "\N{COMBINING ACUTE ACCENT}" * 9).encode())
-            with self.assertRaisesRegex(privacy.PrivacyError, "normalization exceeds"):
+            with pytest.raises(privacy.PrivacyError, match="normalization exceeds"):
                 privacy.scan_public_bytes(
                     ("x" + "\N{COMBINING ACUTE ACCENT}" * 10).encode()
                 )
 
-    def test_non_ascii_normalization_suffixes_match_the_whole_string_oracle(self):
+    @pytest.mark.parametrize(
+        "encoding_raw_case",
+        range(12),
+        ids=(
+            "utf8",
+            "utf8-aligned",
+            "utf8-bom",
+            "utf8-bom-aligned",
+            "utf16-le",
+            "utf16-le-aligned",
+            "utf16-le-bom",
+            "utf16-le-bom-aligned",
+            "utf16-be",
+            "utf16-be-aligned",
+            "utf16-be-bom",
+            "utf16-be-bom-aligned",
+        ),
+    )
+    @pytest.mark.parametrize(
+        "chunk_bytes_case",
+        range(8),
+        ids=(
+            "chunk-2",
+            "chunk-3",
+            "chunk-4",
+            "chunk-5",
+            "chunk-6",
+            "chunk-7",
+            "chunk-8",
+            "chunk-9",
+        ),
+    )
+    @pytest.mark.parametrize(
+        "case_opening_rendered_case",
+        range(7),
+        ids=(
+            "hangul",
+            "tibetan-0f73-5",
+            "tibetan-0f73-6",
+            "tibetan-0f75-5",
+            "tibetan-0f75-6",
+            "tibetan-0f81-5",
+            "tibetan-0f81-6",
+        ),
+    )
+    def test_non_ascii_normalization_suffixes_match_the_whole_string_oracle(
+        self, encoding_raw_case, chunk_bytes_case, case_opening_rendered_case
+    ):
         def encoded_variants(value):
             utf8 = value.encode("utf-8")
             utf16_le = value.encode("utf-16-le")
@@ -3555,68 +3845,146 @@ class Issue123PrivacyScannerTest(unittest.TestCase):
             for character in ("\u0f73", "\u0f75", "\u0f81")
             for count in (5, 6)
         )
-        for case, opening, rendered in cases:
-            self.assertEqual(
-                privacy._privacy_nfkc_casefold(rendered),
-                privacy._privacy_nfkc_casefold(opening),
-            )
-            context = privacy._privacy_scan_context((opening,))
-            for chunk_bytes in range(2, 10):
-                with mock.patch.object(
-                    privacy, "PRIVACY_TEXT_INPUT_CHUNK_BYTES", chunk_bytes
-                ):
-                    for encoding, raw in encoded_variants(rendered):
-                        with (
-                            self.subTest(
-                                case=case,
-                                chunk_bytes=chunk_bytes,
-                                encoding=encoding,
-                            ),
-                            self.assertRaisesRegex(
-                                privacy.PrivacyError, "private opening"
-                            ),
-                        ):
-                            privacy.scan_public_bytes(
-                                raw,
-                                forbidden_values=context,
-                            )
+        case_opening_rendered_case_values = tuple(cases)
+        assert len(case_opening_rendered_case_values) == 7
+        case, opening, rendered = case_opening_rendered_case_values[
+            case_opening_rendered_case
+        ]
+        assert privacy._privacy_nfkc_casefold(
+            rendered
+        ) == privacy._privacy_nfkc_casefold(opening)
+        context = privacy._privacy_scan_context((opening,))
+        chunk_bytes_case_values = tuple(range(2, 10))
+        assert len(chunk_bytes_case_values) == 8
+        chunk_bytes = chunk_bytes_case_values[chunk_bytes_case]
+        with mock.patch.object(privacy, "PRIVACY_TEXT_INPUT_CHUNK_BYTES", chunk_bytes):
+            encoding_raw_case_values = tuple(encoded_variants(rendered))
+            assert len(encoding_raw_case_values) == 12
+            encoding, raw = encoding_raw_case_values[encoding_raw_case]
+            with pytest.raises(privacy.PrivacyError, match="private opening"):
+                privacy.scan_public_bytes(
+                    raw,
+                    forbidden_values=context,
+                )
 
-        for case, opening, rendered in (
-            ("hangul", hangul_opening, hangul_decomposed),
-            ("tibetan", "\u0f73" * 6, "\u0f73" * 6),
-        ):
-            stream = io.BytesIO()
-            with zipfile.ZipFile(
-                stream, "w", compression=zipfile.ZIP_DEFLATED
-            ) as archive:
-                archive.writestr("package/data.bin", rendered.encode())
-            carriers = (
-                (
-                    "opaque",
-                    f"packages/{case}.bin",
-                    rendered.encode(),
-                    "application/octet-stream",
-                ),
-                (
-                    "zip",
-                    f"packages/{case}.zip",
-                    stream.getvalue(),
-                    "application/zip",
-                ),
-            )
-            with mock.patch.object(privacy, "PRIVACY_TEXT_INPUT_CHUNK_BYTES", 2):
-                for carrier, name, raw, media_type in carriers:
-                    with (
-                        self.subTest(case=case, carrier=carrier),
-                        self.assertRaisesRegex(privacy.PrivacyError, "private opening"),
-                    ):
-                        privacy.scan_payload(
-                            name,
-                            raw,
-                            media_type=media_type,
-                            forbidden_values=(opening,),
-                        )
+    @pytest.mark.parametrize(
+        "carrier_name_raw_media_type_case", range(2), ids=("opaque", "zip")
+    )
+    @pytest.mark.parametrize(
+        "case_opening_rendered_case", range(2), ids=("hangul", "tibetan")
+    )
+    def test_non_ascii_normalization_suffixes_match_the_whole_string_oracle_payload_carriers(
+        self, case_opening_rendered_case, carrier_name_raw_media_type_case
+    ):
+        self._check_non_ascii_normalization_suffixes_match_the_whole_string_oracle_payload_carriers_phase(
+            phase="opaque_and_zip",
+            case_opening_rendered_case=case_opening_rendered_case,
+            carrier_name_raw_media_type_case=carrier_name_raw_media_type_case,
+        )
 
+    @pytest.mark.parametrize("carrier_raw_case", range(3), ids=("tar", "gzip", "pax"))
+    @pytest.mark.parametrize(
+        "case_opening_rendered_case", range(2), ids=("hangul", "tibetan")
+    )
+    def test_non_ascii_normalization_suffixes_match_the_whole_string_oracle_payload_carriers_tar_carriers(
+        self, case_opening_rendered_case, carrier_raw_case
+    ):
+        self._check_non_ascii_normalization_suffixes_match_the_whole_string_oracle_payload_carriers_phase(
+            phase="tar_carriers",
+            case_opening_rendered_case=case_opening_rendered_case,
+            carrier_raw_case=carrier_raw_case,
+        )
+
+    def _check_non_ascii_normalization_suffixes_match_the_whole_string_oracle_payload_carriers_phase(
+        self,
+        *,
+        phase,
+        carrier_name_raw_media_type_case=None,
+        carrier_raw_case=None,
+        case_opening_rendered_case=None,
+    ):
+        def encoded_variants(value):
+            utf8 = value.encode("utf-8")
+            utf16_le = value.encode("utf-16-le")
+            utf16_be = value.encode("utf-16-be")
+            return (
+                ("utf8", utf8),
+                ("utf8-aligned", b"x" + utf8),
+                ("utf8-bom", b"\xef\xbb\xbf" + utf8),
+                ("utf8-bom-aligned", b"x\xef\xbb\xbf" + utf8),
+                ("utf16-le", utf16_le),
+                ("utf16-le-aligned", b"x" + utf16_le),
+                ("utf16-le-bom", b"\xff\xfe" + utf16_le),
+                ("utf16-le-bom-aligned", b"x\xff\xfe" + utf16_le),
+                ("utf16-be", utf16_be),
+                ("utf16-be-aligned", b"x" + utf16_be),
+                ("utf16-be-bom", b"\xfe\xff" + utf16_be),
+                ("utf16-be-bom-aligned", b"x\xfe\xff" + utf16_be),
+            )
+
+        hangul_opening = "\uac01" * 3
+        hangul_decomposed = ("\u1100\u1161\u11a8") * 3
+        cases = [
+            (
+                "hangul",
+                hangul_opening,
+                hangul_decomposed,
+            )
+        ]
+        cases.extend(
+            (
+                f"tibetan-{ord(character):04x}-{count}",
+                character * count,
+                character * count,
+            )
+            for character in ("\u0f73", "\u0f75", "\u0f81")
+            for count in (5, 6)
+        )
+        case_opening_rendered_case_values = tuple(
+            (
+                ("hangul", hangul_opening, hangul_decomposed),
+                ("tibetan", "\u0f73" * 6, "\u0f73" * 6),
+            )
+        )
+        assert len(case_opening_rendered_case_values) == 2
+        case, opening, rendered = case_opening_rendered_case_values[
+            case_opening_rendered_case
+        ]
+        stream = io.BytesIO()
+        with zipfile.ZipFile(stream, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+            archive.writestr("package/data.bin", rendered.encode())
+        carriers = (
+            (
+                "opaque",
+                f"packages/{case}.bin",
+                rendered.encode(),
+                "application/octet-stream",
+            ),
+            (
+                "zip",
+                f"packages/{case}.zip",
+                stream.getvalue(),
+                "application/zip",
+            ),
+        )
+        with mock.patch.object(privacy, "PRIVACY_TEXT_INPUT_CHUNK_BYTES", 2):
+            if phase == "opaque_and_zip":
+                carrier_name_raw_media_type_case_values = tuple(carriers)
+                assert len(carrier_name_raw_media_type_case_values) == 2
+                carrier, name, raw, media_type = (
+                    carrier_name_raw_media_type_case_values[
+                        carrier_name_raw_media_type_case
+                    ]
+                )
+                with pytest.raises(privacy.PrivacyError, match="private opening"):
+                    privacy.scan_payload(
+                        name,
+                        raw,
+                        media_type=media_type,
+                        forbidden_values=(opening,),
+                    )
+
+            if phase == "tar_carriers":
                 tar_carriers = (
                     (
                         "tar",
@@ -3645,36 +4013,42 @@ class Issue123PrivacyScannerTest(unittest.TestCase):
                         ),
                     ),
                 )
-                for carrier, raw in tar_carriers:
-                    with (
-                        self.subTest(case=case, carrier=carrier),
-                        mock.patch.object(
-                            privacy.tarfile,
-                            "open",
-                            side_effect=AssertionError("logical parser entered"),
-                        ) as opened,
-                        self.assertRaisesRegex(privacy.PrivacyError, "private opening"),
-                    ):
-                        privacy.scan_payload(
-                            (
-                                f"packages/{case}-pax.tar"
-                                if carrier == "pax"
-                                else f"packages/{case}.{carrier}"
-                            ),
-                            raw,
-                            media_type=(
-                                "application/gzip"
-                                if carrier == "tar.gz"
-                                else "application/x-tar"
-                            ),
-                            forbidden_values=(opening,),
-                        )
-                    opened.assert_not_called()
+                carrier_raw_case_values = tuple(tar_carriers)
+                assert len(carrier_raw_case_values) == 3
+                carrier, raw = carrier_raw_case_values[carrier_raw_case]
+                with (
+                    mock.patch.object(
+                        privacy.tarfile,
+                        "open",
+                        side_effect=AssertionError("logical parser entered"),
+                    ) as opened,
+                    pytest.raises(privacy.PrivacyError, match="private opening"),
+                ):
+                    privacy.scan_payload(
+                        (
+                            f"packages/{case}-pax.tar"
+                            if carrier == "pax"
+                            else f"packages/{case}.{carrier}"
+                        ),
+                        raw,
+                        media_type=(
+                            "application/gzip"
+                            if carrier == "tar.gz"
+                            else "application/x-tar"
+                        ),
+                        forbidden_values=(opening,),
+                    )
+                opened.assert_not_called()
 
+    def test_non_ascii_normalization_suffixes_match_the_whole_string_oracle_unicode_inventory(
+        self,
+    ):
         unstable_starts = 0
         unstable_ends = 0
         composition_participants = set()
         inert_violations = []
+        # This is an exhaustive Unicode inventory, not independent examples: the
+        # aggregate sets and counts below are the asserted frozen oracle.
         for codepoint in range(0x110000):
             if 0xD800 <= codepoint <= 0xDFFF:
                 continue
@@ -3696,12 +4070,12 @@ class Issue123PrivacyScannerTest(unittest.TestCase):
             )
             if starts_nonstarter:
                 unstable_starts += 1
-                self.assertFalse(
+                assert not (
                     privacy._starts_normalization_starter_group(character + "A", 0)
                 )
             if ends_nonstarter:
                 unstable_ends += 1
-                self.assertFalse(
+                assert not (
                     privacy._starts_normalization_starter_group(character + "A", 0)
                 )
             if codepoint not in privacy._NORMALIZATION_NON_INERT_CODEPOINTS and (
@@ -3715,22 +4089,20 @@ class Issue123PrivacyScannerTest(unittest.TestCase):
         composition_participants.update(range(0x1161, 0x1176))
         composition_participants.update(range(0x11A8, 0x11C3))
         composition_participants.update(range(0xAC00, 0xD7A4, 28))
-        self.assertEqual(inert_violations, [])
-        self.assertEqual(
-            composition_participants - privacy._NORMALIZATION_NON_INERT_CODEPOINTS,
-            set(),
+        assert inert_violations == []
+        assert (
+            composition_participants - privacy._NORMALIZATION_NON_INERT_CODEPOINTS
+            == set()
         )
-        self.assertGreater(unstable_starts, 0)
-        self.assertGreater(unstable_ends, 0)
-        self.assertTrue(
-            all(
+        assert unstable_starts > 0
+        assert unstable_ends > 0
+        assert all(
+            (
                 privacy._starts_normalization_starter_group(chr(codepoint) + "A", 0)
                 for codepoint in range(128)
             )
         )
-        self.assertFalse(
-            privacy._starts_normalization_starter_group("A\N{COMBINING RING ABOVE}", 0)
-        )
+        assert not (privacy._starts_normalization_starter_group("Å", 0))
         for left, right in (
             (
                 "A\N{COMBINING ACUTE ACCENT}",
@@ -3741,10 +4113,10 @@ class Issue123PrivacyScannerTest(unittest.TestCase):
                 "\u7373\N{COMBINING RING ABOVE}",
             ),
         ):
-            self.assertEqual(
-                privacy._privacy_nfkc_casefold(left + right),
-                privacy._privacy_nfkc_casefold(left)
-                + privacy._privacy_nfkc_casefold(right),
+            assert privacy._privacy_nfkc_casefold(
+                left + right
+            ) == privacy._privacy_nfkc_casefold(left) + privacy._privacy_nfkc_casefold(
+                right
             )
 
         with (
@@ -3753,10 +4125,24 @@ class Issue123PrivacyScannerTest(unittest.TestCase):
             mock.patch.object(privacy, "PRIVACY_TEXT_INPUT_CHUNK_BYTES", 2),
         ):
             privacy.scan_public_bytes("\u0301".encode() * 8)
-            with self.assertRaisesRegex(privacy.PrivacyError, "normalization exceeds"):
+            with pytest.raises(privacy.PrivacyError, match="normalization exceeds"):
                 privacy.scan_public_bytes("\u0301".encode() * 9)
 
-    def test_normalized_pattern_streams_close_whitespace_and_email_bounds(self):
+    @pytest.mark.parametrize(
+        "raw_case",
+        range(6),
+        ids=(
+            "token",
+            "host",
+            "json-host",
+            "fullwidth-host",
+            "fullwidth-token",
+            "fullwidth-json-host",
+        ),
+    )
+    def test_normalized_pattern_streams_close_whitespace_and_email_bounds(
+        self, raw_case
+    ):
         long_space = b" " * (privacy.MAX_PRIVACY_BUILTIN_PATTERN_BYTES + 257)
         unsafe = (
             b"token" + long_space + b"=x",
@@ -3781,23 +4167,25 @@ class Issue123PrivacyScannerTest(unittest.TestCase):
             ).encode(),
         )
         with mock.patch.object(privacy, "PRIVACY_TEXT_INPUT_CHUNK_BYTES", 7):
-            for raw in unsafe:
-                with (
-                    self.subTest(raw=raw[:12]),
-                    self.assertRaises(privacy.PrivacyError),
-                ):
-                    privacy.scan_public_bytes(raw)
-            with self.assertRaisesRegex(privacy.PrivacyError, "private opening"):
+            raw_case_values = tuple(unsafe)
+            assert len(raw_case_values) == 6
+            raw = raw_case_values[raw_case]
+            with pytest.raises(privacy.PrivacyError):
+                privacy.scan_public_bytes(raw)
+            with pytest.raises(privacy.PrivacyError, match="private opening"):
                 privacy.scan_public_bytes(
                     b"prefix-private-opening-suffix",
                     forbidden_values=("private-opening",),
                 )
 
         privacy.scan_public_bytes(b"a" * 65 + b"@example.com")
-        with self.assertRaisesRegex(privacy.PrivacyError, "email address"):
+        with pytest.raises(privacy.PrivacyError, match="email address"):
             privacy.scan_public_bytes(b"a" * 64 + b"@example.com")
 
-    def test_forbidden_plan_is_frozen_once_and_has_an_aggregate_work_bound(self):
+    @pytest.mark.parametrize("invalid_case", range(2), ids=("string", "bytes"))
+    def test_forbidden_plan_is_frozen_once_and_has_an_aggregate_work_bound(
+        self, invalid_case
+    ):
         class OneShotValues:
             def __init__(self):
                 self.iterations = 0
@@ -3825,15 +4213,14 @@ class Issue123PrivacyScannerTest(unittest.TestCase):
                 raw,
                 forbidden_values=values,
             )
-        self.assertEqual(values.iterations, 1)
-        self.assertEqual(prepared.call_count, 1)
+        assert values.iterations == 1
+        assert prepared.call_count == 1
 
-        for invalid in ("private-opening", b"private-opening"):
-            with (
-                self.subTest(container=type(invalid).__name__),
-                self.assertRaisesRegex(privacy.PrivacyError, "scan exceeds"),
-            ):
-                privacy.scan_public_bytes(b"safe", forbidden_values=invalid)
+        invalid_case_values = tuple(("private-opening", b"private-opening"))
+        assert len(invalid_case_values) == 2
+        invalid = invalid_case_values[invalid_case]
+        with pytest.raises(privacy.PrivacyError, match="scan exceeds"):
+            privacy.scan_public_bytes(b"safe", forbidden_values=invalid)
 
         class InfiniteValues:
             def __init__(self):
@@ -3849,10 +4236,10 @@ class Issue123PrivacyScannerTest(unittest.TestCase):
         infinite = InfiniteValues()
         with (
             mock.patch.object(privacy, "MAX_IDENTITY_SCAN_VALUES", 2),
-            self.assertRaisesRegex(privacy.PrivacyError, "scan exceeds"),
+            pytest.raises(privacy.PrivacyError, match="scan exceeds"),
         ):
             privacy.scan_public_bytes(b"safe", forbidden_values=infinite)
-        self.assertEqual(infinite.next_calls, 3)
+        assert infinite.next_calls == 3
 
         iterator_marker = "private-iterator-exception-marker"
 
@@ -3860,30 +4247,25 @@ class Issue123PrivacyScannerTest(unittest.TestCase):
             def __iter__(self):
                 raise RuntimeError(iterator_marker)
 
-        with self.assertRaises(privacy.PrivacyError) as caught:
+        with pytest.raises(privacy.PrivacyError) as caught:
             privacy.scan_public_bytes(b"safe", forbidden_values=RaisingValues())
-        self.assertIsNone(caught.exception.__cause__)
-        self.assertIsNone(caught.exception.__context__)
-        self.assertNotIn(
-            iterator_marker,
-            " ".join(
-                (
-                    str(caught.exception),
-                    repr(caught.exception),
-                    "".join(
-                        traceback.format_exception(
-                            type(caught.exception),
-                            caught.exception,
-                            caught.exception.__traceback__,
-                        )
-                    ),
-                )
-            ),
+        assert caught.value.__cause__ is None
+        assert caught.value.__context__ is None
+        assert iterator_marker not in " ".join(
+            (
+                str(caught.value),
+                repr(caught.value),
+                "".join(
+                    traceback.format_exception(
+                        type(caught.value), caught.value, caught.value.__traceback__
+                    )
+                ),
+            )
         )
 
         with (
             mock.patch.object(privacy, "MAX_PRIVACY_SCAN_CANONICAL_BYTES", 8),
-            self.assertRaisesRegex(privacy.PrivacyError, "scan exceeds"),
+            pytest.raises(privacy.PrivacyError, match="scan exceeds"),
         ):
             privacy.scan_public_bytes(
                 b"public-data-that-does-not-match",
@@ -3898,38 +4280,46 @@ class Issue123PrivacyScannerTest(unittest.TestCase):
                 "_privacy_nfkc_casefold",
                 wraps=canonicalize,
             ) as transformed,
-            self.assertRaisesRegex(privacy.PrivacyError, "scan exceeds"),
+            pytest.raises(privacy.PrivacyError, match="scan exceeds"),
         ):
             privacy._prepare_forbidden_value_plan(("abcd", "efgh", "ijkl"))
-        self.assertEqual(transformed.call_count, 1)
+        assert transformed.call_count == 1
 
-    def test_canonical_matcher_duplicate_prefix_and_failure_links(self):
+    @pytest.mark.parametrize(
+        ("candidate", "split"),
+        [
+            pytest.param(
+                candidate, split, id=f"{candidate.decode() or 'empty'}-split-{split}"
+            )
+            for candidate in (
+                b"",
+                b"her",
+                b"ushers",
+                b"ahishers",
+                b"nomatch",
+                b"sh",
+                b"she",
+            )
+            for split in range(len(candidate) + 1)
+        ],
+    )
+    def test_canonical_matcher_duplicate_prefix_and_failure_links(
+        self, candidate, split
+    ):
         duplicate = privacy._build_canonical_matcher((b"abc", b"abc"))
-        self.assertEqual(len(duplicate.transitions), 4)
+        assert len(duplicate.transitions) == 4
 
         patterns = (b"he", b"she", b"his", b"hers", b"he")
         matcher = privacy._build_canonical_matcher(patterns)
-        candidates = (
-            b"",
-            b"her",
-            b"ushers",
-            b"ahishers",
-            b"nomatch",
-            b"sh",
-            b"she",
-        )
-        for candidate in candidates:
-            expected = any(pattern in candidate for pattern in patterns)
-            for split in range(len(candidate) + 1):
-                state, first = matcher.scan(candidate[:split])
-                _state, second = matcher.scan(candidate[split:], state)
-                with self.subTest(candidate=candidate, split=split):
-                    self.assertEqual(first or second, expected)
+        expected = any(pattern in candidate for pattern in patterns)
+        state, first = matcher.scan(candidate[:split])
+        _state, second = matcher.scan(candidate[split:], state)
+        assert (first or second) == expected
 
         prefix = privacy._build_canonical_matcher((b"ab", b"abcd"))
         _state, matched = prefix.scan(b"ab")
-        self.assertTrue(matched)
-        with self.assertRaises(TypeError):
+        assert matched
+        with pytest.raises(TypeError):
             prefix.transitions[0][ord("z")] = 1
 
     def test_gzip_preflight_uses_exact_bounded_storage_and_no_copy_reader(self):
@@ -3941,22 +4331,22 @@ class Issue123PrivacyScannerTest(unittest.TestCase):
         ) as allocate:
             decoded = privacy._decompress_gzip_bounded("fixture.tar.gz", compressed)
         allocate.assert_called_once_with(len(tar_raw))
-        self.assertIs(decoded, allocation)
-        self.assertEqual(decoded, tar_raw)
+        assert decoded is allocation
+        assert decoded == tar_raw
 
-        with self.assertRaises(TypeError):
+        with pytest.raises(TypeError):
             privacy._TarBufferReader(decoded)
         reader = privacy._TarBufferReader(bytes(decoded))
-        self.assertEqual(reader.read(7), tar_raw[:7])
-        self.assertEqual(reader.seek(-4, io.SEEK_END), len(tar_raw) - 4)
-        self.assertEqual(reader.read(), tar_raw[-4:])
+        assert reader.read(7) == tar_raw[:7]
+        assert reader.seek(-4, io.SEEK_END) == len(tar_raw) - 4
+        assert reader.read() == tar_raw[-4:]
         past_eof = len(tar_raw) + 17
-        self.assertEqual(reader.seek(past_eof), past_eof)
-        self.assertEqual(reader.read(2), b"")
-        self.assertEqual(reader.tell(), past_eof)
-        self.assertEqual(reader.seek(-past_eof - 1, io.SEEK_CUR), 0)
-        self.assertEqual(reader.seek(-len(tar_raw) - 1, io.SEEK_END), 0)
-        with self.assertRaises(ValueError):
+        assert reader.seek(past_eof) == past_eof
+        assert reader.read(2) == b""
+        assert reader.tell() == past_eof
+        assert reader.seek(-past_eof - 1, io.SEEK_CUR) == 0
+        assert reader.seek(-len(tar_raw) - 1, io.SEEK_END) == 0
+        with pytest.raises(ValueError):
             reader.seek(-1)
 
         advertised_too_large = compressed[:-4] + (len(tar_raw) + 1).to_bytes(
@@ -3973,7 +4363,7 @@ class Issue123PrivacyScannerTest(unittest.TestCase):
                 privacy, "MAX_TAR_RESIDENT_BYTES", fixed + 2 * len(tar_raw)
             ),
             mock.patch.object(privacy, "_allocate_tar_buffer") as allocate,
-            self.assertRaisesRegex(privacy.PrivacyError, "oversized"),
+            pytest.raises(privacy.PrivacyError, match="oversized"),
         ):
             privacy._decompress_gzip_bounded(
                 "resident-preflight.tar.gz", advertised_too_large
@@ -3981,91 +4371,133 @@ class Issue123PrivacyScannerTest(unittest.TestCase):
         allocate.assert_not_called()
 
         inconsistent_isize = compressed[:-4] + (len(tar_raw) - 1).to_bytes(4, "little")
-        with self.assertRaises(privacy.PrivacyError) as caught:
+        with pytest.raises(privacy.PrivacyError) as caught:
             privacy._decompress_gzip_bounded(
                 "actual-size-check.tar.gz", inconsistent_isize
             )
-        self.assertIsNone(caught.exception.__cause__)
-        self.assertIsNone(caught.exception.__context__)
+        assert caught.value.__cause__ is None
+        assert caught.value.__context__ is None
 
-    def test_tar_member_scan_avoids_exfileobject_request_sized_allocations(self):
+    @pytest.mark.parametrize("suffix_raw_case", range(2), ids=("tar", "gzip"))
+    def test_tar_member_scan_avoids_exfileobject_request_sized_allocations(
+        self, suffix_raw_case
+    ):
         body = b"s" * (64 * 1024)
         tar_raw = _physical_tar_bytes([_ordinary_tar_record("package/data.bin", body)])
-        for suffix, raw in (
-            ("tar", tar_raw),
-            ("tar.gz", _gzip_bytes(tar_raw)),
-        ):
-            with (
-                self.subTest(suffix=suffix),
-                mock.patch.object(
-                    privacy.tarfile.TarFile,
-                    "extractfile",
-                    side_effect=AssertionError("ExFileObject storage requested"),
-                ) as extractfile,
-            ):
-                privacy.scan_payload(f"packages/member.{suffix}", raw)
-            extractfile.assert_not_called()
+        suffix_raw_case_values = tuple(
+            (
+                ("tar", tar_raw),
+                ("tar.gz", _gzip_bytes(tar_raw)),
+            )
+        )
+        assert len(suffix_raw_case_values) == 2
+        suffix, raw = suffix_raw_case_values[suffix_raw_case]
+        with mock.patch.object(
+            privacy.tarfile.TarFile,
+            "extractfile",
+            side_effect=AssertionError("ExFileObject storage requested"),
+        ) as extractfile:
+            privacy.scan_payload(f"packages/member.{suffix}", raw)
+        extractfile.assert_not_called()
 
-    def test_tar_library_exceptions_are_chain_free_and_non_leaking(self):
+    @pytest.mark.parametrize("suffix_payload_case", range(2), ids=("tar", "gzip"))
+    def test_tar_library_exceptions_are_chain_free_and_non_leaking(
+        self, suffix_payload_case
+    ):
+        self._check_tar_library_exceptions_are_chain_free_and_non_leaking_phase(
+            phase="headers", suffix_payload_case=suffix_payload_case
+        )
+
+    @pytest.mark.parametrize("stage_case", range(2), ids=("iteration", "close"))
+    @pytest.mark.parametrize("suffix_payload_case", range(2), ids=("tar", "gzip"))
+    def test_tar_library_exceptions_are_chain_free_and_non_leaking_iteration_and_close(
+        self, suffix_payload_case, stage_case
+    ):
+        self._check_tar_library_exceptions_are_chain_free_and_non_leaking_phase(
+            phase="iteration_and_close",
+            suffix_payload_case=suffix_payload_case,
+            stage_case=stage_case,
+        )
+
+    @pytest.mark.parametrize("suffix_payload_case", range(2), ids=("tar", "gzip"))
+    def test_tar_library_exceptions_are_chain_free_and_non_leaking_open_errors(
+        self, suffix_payload_case
+    ):
+        self._check_tar_library_exceptions_are_chain_free_and_non_leaking_phase(
+            phase="open_errors", suffix_payload_case=suffix_payload_case
+        )
+
+    @pytest.mark.parametrize("raw_case", range(2), ids=("invalid-pax", "invalid-gnu"))
+    def test_tar_library_exceptions_are_chain_free_and_non_leaking_invalid_helpers(
+        self, raw_case
+    ):
+        self._check_tar_library_exceptions_are_chain_free_and_non_leaking_phase(
+            phase="invalid_helpers", raw_case=raw_case
+        )
+
+    def _check_tar_library_exceptions_are_chain_free_and_non_leaking_phase(
+        self, *, phase, stage_case=None, suffix_payload_case=None, raw_case=None
+    ):
         raw_tar = _physical_tar_bytes([_ordinary_tar_record()])
         marker = "private-library-exception-marker"
         with tarfile.open(fileobj=io.BytesIO(raw_tar), mode="r:") as archive:
             logical_info = next(iter(archive))
 
         def assert_sanitized(caught):
-            error = caught.exception
-            self.assertIsNone(error.__cause__)
-            self.assertIsNone(error.__context__)
+            error = caught.value
+            assert error.__cause__ is None
+            assert error.__context__ is None
             rendered = "".join(
                 traceback.format_exception(type(error), error, error.__traceback__)
             )
             diagnostics = " ".join((str(error), repr(error), rendered))
-            self.assertNotIn(marker, diagnostics)
+            assert marker not in diagnostics
 
-        for suffix, payload in (("tar", raw_tar), ("tar.gz", _gzip_bytes(raw_tar))):
+        if phase in ("headers", "iteration_and_close", "open_errors"):
+            suffix_payload_case_values = tuple(
+                (("tar", raw_tar), ("tar.gz", _gzip_bytes(raw_tar)))
+            )
+            assert len(suffix_payload_case_values) == 2
+            suffix, payload = suffix_payload_case_values[suffix_payload_case]
+        if phase == "headers":
             with (
-                self.subTest(stage="header", suffix=suffix),
                 mock.patch.object(
                     privacy.tarfile.TarInfo,
                     "frombuf",
                     side_effect=RecursionError(marker),
                 ),
-                self.assertRaises(privacy.PrivacyError) as caught,
+                pytest.raises(privacy.PrivacyError) as caught,
             ):
                 privacy.scan_payload(f"packages/header.{suffix}", payload)
             assert_sanitized(caught)
 
-            for stage in ("iteration", "close"):
-                fake_archive = mock.MagicMock()
-                fake_archive.pax_headers = {}
-                fake_archive.__iter__.return_value = iter((logical_info,))
-                if stage == "iteration":
-                    fake_archive.__iter__.side_effect = OSError(marker)
-                else:
-                    fake_archive.close.side_effect = OSError(marker)
-                with (
-                    self.subTest(stage=stage, suffix=suffix),
-                    mock.patch.object(
-                        privacy.tarfile, "open", return_value=fake_archive
-                    ),
-                    self.assertRaises(privacy.PrivacyError) as caught,
-                ):
-                    privacy.scan_payload(f"packages/{stage}.{suffix}", payload)
-                assert_sanitized(caught)
-
+        if phase == "iteration_and_close":
+            stage_case_values = tuple(("iteration", "close"))
+            assert len(stage_case_values) == 2
+            stage = stage_case_values[stage_case]
+            fake_archive = mock.MagicMock()
+            fake_archive.pax_headers = {}
+            fake_archive.__iter__.return_value = iter((logical_info,))
+            if stage == "iteration":
+                fake_archive.__iter__.side_effect = OSError(marker)
+            else:
+                fake_archive.close.side_effect = OSError(marker)
             with (
-                self.subTest(stage="logical", suffix=suffix),
-                mock.patch.object(
-                    privacy.tarfile,
-                    "open",
-                    side_effect=OSError(marker),
-                ),
-                self.assertRaises(privacy.PrivacyError) as caught,
+                mock.patch.object(privacy.tarfile, "open", return_value=fake_archive),
+                pytest.raises(privacy.PrivacyError) as caught,
+            ):
+                privacy.scan_payload(f"packages/{stage}.{suffix}", payload)
+            assert_sanitized(caught)
+
+        if phase == "open_errors":
+            with (
+                mock.patch.object(privacy.tarfile, "open", side_effect=OSError(marker)),
+                pytest.raises(privacy.PrivacyError) as caught,
             ):
                 privacy.scan_payload(f"packages/logical.{suffix}", payload)
             assert_sanitized(caught)
 
-        with self.assertRaises(privacy.PrivacyError) as caught:
+        with pytest.raises(privacy.PrivacyError) as caught:
             privacy.scan_public_bytes(
                 marker.upper().encode(),
                 forbidden_values=(marker,),
@@ -4080,7 +4512,7 @@ class Issue123PrivacyScannerTest(unittest.TestCase):
             mock.patch.object(
                 privacy.zlib, "decompressobj", return_value=FailingDecompressor()
             ),
-            self.assertRaises(privacy.PrivacyError) as caught,
+            pytest.raises(privacy.PrivacyError) as caught,
         ):
             privacy.scan_payload("packages/zlib.tar.gz", _gzip_bytes(raw_tar))
         assert_sanitized(caught)
@@ -4089,48 +4521,61 @@ class Issue123PrivacyScannerTest(unittest.TestCase):
             mock.patch.object(
                 privacy.zlib, "decompressobj", side_effect=ValueError(marker)
             ),
-            self.assertRaises(privacy.PrivacyError) as caught,
+            pytest.raises(privacy.PrivacyError) as caught,
         ):
             privacy.scan_payload("packages/zlib-init.tar.gz", _gzip_bytes(raw_tar))
         assert_sanitized(caught)
 
-        invalid_helpers = (
-            _physical_tar_bytes(
-                [("././@PaxHeader", tarfile.XHDTYPE, b"19 comment=\xffxxxxxx\n")]
-            ),
-            _physical_tar_bytes(
-                [("././@LongLink", tarfile.GNUTYPE_LONGNAME, b"\xff" + b"\0")]
-            ),
-        )
-        for raw in invalid_helpers:
-            with self.assertRaises(privacy.PrivacyError) as caught:
-                privacy.scan_payload("packages/invalid-helper.tar", raw)
-            self.assertIsNone(caught.exception.__cause__)
-            self.assertIsNone(caught.exception.__context__)
-
-    def test_pax_key_normalization_and_raw_budget_edges_fail_closed(self):
-        for key, expected in (
-            (_fullwidth_ascii("SIZE"), "unsupported tar size override"),
-            ("LiNkPaTh", "unsupported link path"),
-            ("Schily.ACL.ACE", "unsupported tar metadata override"),
-        ):
-            raw = _physical_tar_bytes(
-                [
-                    _pax_helper(tarfile.XHDTYPE, ((key, "4"),)),
-                    _ordinary_tar_record(),
-                ]
+        if phase == "invalid_helpers":
+            invalid_helpers = (
+                _physical_tar_bytes(
+                    [("././@PaxHeader", tarfile.XHDTYPE, b"19 comment=\xffxxxxxx\n")]
+                ),
+                _physical_tar_bytes(
+                    [("././@LongLink", tarfile.GNUTYPE_LONGNAME, b"\xff" + b"\0")]
+                ),
             )
-            with (
-                self.subTest(key=key),
-                mock.patch.object(
-                    privacy.tarfile,
-                    "open",
-                    side_effect=AssertionError("logical parser entered"),
-                ) as opened,
-                self.assertRaisesRegex(privacy.PrivacyError, expected),
-            ):
-                privacy.scan_payload("packages/normalized-key.tar", raw)
-            opened.assert_not_called()
+            raw_case_values = tuple(invalid_helpers)
+            assert len(raw_case_values) == 2
+            raw = raw_case_values[raw_case]
+            with pytest.raises(privacy.PrivacyError) as caught:
+                privacy.scan_payload("packages/invalid-helper.tar", raw)
+            assert caught.value.__cause__ is None
+            assert caught.value.__context__ is None
+
+    @pytest.mark.parametrize(
+        "key_expected_case",
+        range(3),
+        ids=("fullwidth-size", "mixed-case-linkpath", "mixed-case-acl"),
+    )
+    def test_pax_key_normalization_and_raw_budget_edges_fail_closed(
+        self, key_expected_case
+    ):
+        key_expected_case_values = tuple(
+            (
+                (_fullwidth_ascii("SIZE"), "unsupported tar size override"),
+                ("LiNkPaTh", "unsupported link path"),
+                ("Schily.ACL.ACE", "unsupported tar metadata override"),
+            )
+        )
+        assert len(key_expected_case_values) == 3
+        key, expected = key_expected_case_values[key_expected_case]
+        raw = _physical_tar_bytes(
+            [
+                _pax_helper(tarfile.XHDTYPE, ((key, "4"),)),
+                _ordinary_tar_record(),
+            ]
+        )
+        with (
+            mock.patch.object(
+                privacy.tarfile,
+                "open",
+                side_effect=AssertionError("logical parser entered"),
+            ) as opened,
+            pytest.raises(privacy.PrivacyError, match=expected),
+        ):
+            privacy.scan_payload("packages/normalized-key.tar", raw)
+        opened.assert_not_called()
 
         within = _physical_tar_bytes(
             [
@@ -4161,12 +4606,97 @@ class Issue123PrivacyScannerTest(unittest.TestCase):
                 "open",
                 side_effect=AssertionError("logical parser entered"),
             ) as opened,
-            self.assertRaisesRegex(privacy.PrivacyError, "PAX record closure"),
+            pytest.raises(privacy.PrivacyError, match="PAX record closure"),
         ):
             privacy.scan_payload("packages/raw-budget-over.tar", beyond)
         opened.assert_not_called()
 
-    def test_pax_allowlist_aliases_and_identical_overlay_budget_matrix(self):
+    @pytest.mark.parametrize(
+        "case_helper_type_key_value_case",
+        range(77),
+        ids=(
+            "path-swapcase-local",
+            "path-swapcase-global",
+            "path-fullwidth-local",
+            "path-fullwidth-global",
+            "mtime-swapcase-local",
+            "mtime-swapcase-global",
+            "mtime-fullwidth-local",
+            "mtime-fullwidth-global",
+            "comment-swapcase-local",
+            "comment-swapcase-global",
+            "comment-fullwidth-local",
+            "comment-fullwidth-global",
+            "hdrcharset-swapcase-local",
+            "hdrcharset-swapcase-global",
+            "hdrcharset-fullwidth-local",
+            "hdrcharset-fullwidth-global",
+            "uid-swapcase-local",
+            "uid-swapcase-global",
+            "uid-fullwidth-local",
+            "uid-fullwidth-global",
+            "gid-swapcase-local",
+            "gid-swapcase-global",
+            "gid-fullwidth-local",
+            "gid-fullwidth-global",
+            "uname-swapcase-local",
+            "uname-swapcase-global",
+            "uname-fullwidth-local",
+            "uname-fullwidth-global",
+            "gname-swapcase-local",
+            "gname-swapcase-global",
+            "gname-fullwidth-local",
+            "gname-fullwidth-global",
+            "SUN.holesdata-original-local",
+            "SUN.holesdata-original-global",
+            "SUN.holesdata-swapcase-local",
+            "SUN.holesdata-swapcase-global",
+            "SUN.holesdata-fullwidth-local",
+            "SUN.holesdata-fullwidth-global",
+            "SCHILY.acl.ace-original-local",
+            "SCHILY.acl.ace-original-global",
+            "SCHILY.acl.ace-swapcase-local",
+            "SCHILY.acl.ace-swapcase-global",
+            "SCHILY.acl.ace-fullwidth-local",
+            "SCHILY.acl.ace-fullwidth-global",
+            "RHT.security.selinux-original-local",
+            "RHT.security.selinux-original-global",
+            "RHT.security.selinux-swapcase-local",
+            "RHT.security.selinux-swapcase-global",
+            "RHT.security.selinux-fullwidth-local",
+            "RHT.security.selinux-fullwidth-global",
+            "LIBARCHIVE.symlinktype-original-local",
+            "LIBARCHIVE.symlinktype-original-global",
+            "LIBARCHIVE.symlinktype-swapcase-local",
+            "LIBARCHIVE.symlinktype-swapcase-global",
+            "LIBARCHIVE.symlinktype-fullwidth-local",
+            "LIBARCHIVE.symlinktype-fullwidth-global",
+            "SCHILY.devmajor-original-local",
+            "SCHILY.devmajor-original-global",
+            "SCHILY.devmajor-swapcase-local",
+            "SCHILY.devmajor-swapcase-global",
+            "SCHILY.devmajor-fullwidth-local",
+            "SCHILY.devmajor-fullwidth-global",
+            "SCHILY.devminor-original-local",
+            "SCHILY.devminor-original-global",
+            "SCHILY.devminor-swapcase-local",
+            "SCHILY.devminor-swapcase-global",
+            "SCHILY.devminor-fullwidth-local",
+            "SCHILY.devminor-fullwidth-global",
+            "SCHILY.ino-original-local",
+            "SCHILY.ino-original-global",
+            "SCHILY.ino-swapcase-local",
+            "SCHILY.ino-swapcase-global",
+            "SCHILY.ino-fullwidth-local",
+            "SCHILY.ino-fullwidth-global",
+            "unknown-local",
+            "unknown-global",
+            "global-path",
+        ),
+    )
+    def test_pax_allowlist_aliases_and_identical_overlay_budget_matrix(
+        self, case_helper_type_key_value_case
+    ):
         values = {
             "path": "package/pax-name.bin",
             "mtime": "1.5",
@@ -4212,25 +4742,78 @@ class Issue123PrivacyScannerTest(unittest.TestCase):
                 ),
             )
         )
-        for case, helper_type, key, value in rejected:
-            raw = _physical_tar_bytes(
-                [
-                    _pax_helper(helper_type, ((key, value),)),
-                    _ordinary_tar_record(),
-                ]
-            )
-            with (
-                self.subTest(case=case, key=key, helper_type=helper_type),
-                mock.patch.object(
-                    privacy.tarfile,
-                    "open",
-                    side_effect=AssertionError("logical parser entered"),
-                ) as opened,
-                self.assertRaises(privacy.PrivacyError),
-            ):
-                privacy.scan_payload("packages/rejected-key.tar", raw)
-            opened.assert_not_called()
+        case_helper_type_key_value_case_values = tuple(rejected)
+        assert len(case_helper_type_key_value_case_values) == 77
+        case, helper_type, key, value = case_helper_type_key_value_case_values[
+            case_helper_type_key_value_case
+        ]
+        raw = _physical_tar_bytes(
+            [
+                _pax_helper(helper_type, ((key, value),)),
+                _ordinary_tar_record(),
+            ]
+        )
+        with (
+            mock.patch.object(
+                privacy.tarfile,
+                "open",
+                side_effect=AssertionError("logical parser entered"),
+            ) as opened,
+            pytest.raises(privacy.PrivacyError),
+        ):
+            privacy.scan_payload("packages/rejected-key.tar", raw)
+        opened.assert_not_called()
 
+    @pytest.mark.parametrize(
+        "case_helpers_case",
+        range(22),
+        ids=(
+            "local-path",
+            "local-mtime",
+            "global-mtime",
+            "identical-mtime",
+            "local-comment",
+            "global-comment",
+            "identical-comment",
+            "local-hdrcharset",
+            "global-hdrcharset",
+            "identical-hdrcharset",
+            "local-uid",
+            "global-uid",
+            "identical-uid",
+            "local-gid",
+            "global-gid",
+            "identical-gid",
+            "local-uname",
+            "global-uname",
+            "identical-uname",
+            "local-gname",
+            "global-gname",
+            "identical-gname",
+        ),
+    )
+    def test_pax_allowlist_aliases_and_identical_overlay_budget_matrix_accepted_keys(
+        self, case_helpers_case
+    ):
+        values = {
+            "path": "package/pax-name.bin",
+            "mtime": "1.5",
+            "comment": "public",
+            "hdrcharset": "ISO-IR 10646 2000 UTF-8",
+            "uid": "0",
+            "gid": "0",
+            "uname": "",
+            "gname": "",
+        }
+        vendor_values = {
+            "SUN.holesdata": "0",
+            "SCHILY.acl.ace": "public",
+            "RHT.security.selinux": "public",
+            "LIBARCHIVE.symlinktype": "file",
+            "SCHILY.devmajor": "0",
+            "SCHILY.devminor": "0",
+            "SCHILY.ino": "1",
+        }
         positive = []
         for key, value in values.items():
             positive.append(
@@ -4277,15 +4860,55 @@ class Issue123PrivacyScannerTest(unittest.TestCase):
                 side_effect=AssertionError("logical member copy"),
             ) as extractfile,
         ):
-            for case, helpers in positive:
-                raw = _physical_tar_bytes([*helpers, _ordinary_tar_record()])
-                with self.subTest(case=case):
-                    privacy.scan_payload("packages/allowed-key.tar", raw)
+            case_helpers_case_values = tuple(positive)
+            assert len(case_helpers_case_values) == 22
+            case, helpers = case_helpers_case_values[case_helpers_case]
+            raw = _physical_tar_bytes([*helpers, _ordinary_tar_record()])
+            privacy.scan_payload("packages/allowed-key.tar", raw)
         getmembers.assert_not_called()
         extract.assert_not_called()
         extractall.assert_not_called()
         extractfile.assert_not_called()
 
+    @pytest.mark.parametrize(
+        "attribute_exact_case",
+        range(5),
+        ids=(
+            "helper-bytes",
+            "total-bytes",
+            "records",
+            "consecutive-helpers",
+            "effective-associations",
+        ),
+    )
+    def test_pax_allowlist_aliases_and_identical_overlay_budget_matrix_thresholds(
+        self, attribute_exact_case
+    ):
+        self._check_pax_allowlist_aliases_and_identical_overlay_budget_matrix_thresholds_phase(
+            phase="exact", attribute_exact_case=attribute_exact_case
+        )
+
+    @pytest.mark.parametrize(
+        "attribute_exact_case",
+        range(5),
+        ids=(
+            "helper-bytes",
+            "total-bytes",
+            "records",
+            "consecutive-helpers",
+            "effective-associations",
+        ),
+    )
+    def test_pax_allowlist_aliases_and_identical_overlay_budget_matrix_thresholds_below(
+        self, attribute_exact_case
+    ):
+        self._check_pax_allowlist_aliases_and_identical_overlay_budget_matrix_thresholds_phase(
+            phase="below", attribute_exact_case=attribute_exact_case
+        )
+
+    def _check_pax_allowlist_aliases_and_identical_overlay_budget_matrix_thresholds_phase(
+        self, *, phase, attribute_exact_case=None
+    ):
         global_helper = _pax_helper(tarfile.XGLTYPE, (("comment", "public"),))
         local_helper = _pax_helper(tarfile.XHDTYPE, (("comment", "public"),))
         identical = _physical_tar_bytes(
@@ -4301,63 +4924,96 @@ class Issue123PrivacyScannerTest(unittest.TestCase):
             ("MAX_TAR_CONSECUTIVE_HELPERS", 2),
             ("MAX_TAR_EFFECTIVE_PAX_ASSOCIATIONS", 1),
         )
-        for attribute, exact in thresholds:
-            with (
-                self.subTest(attribute=attribute, boundary="exact"),
-                mock.patch.object(privacy, attribute, exact),
-            ):
+        attribute_exact_case_values = tuple(thresholds)
+        assert len(attribute_exact_case_values) == 5
+        attribute, exact = attribute_exact_case_values[attribute_exact_case]
+        if phase == "exact":
+            with mock.patch.object(privacy, attribute, exact):
                 privacy.scan_payload("packages/exact-overlay.tar", identical)
+        if phase == "below":
             with (
-                self.subTest(attribute=attribute, boundary="one-below"),
                 mock.patch.object(privacy, attribute, exact - 1),
                 mock.patch.object(
                     privacy.tarfile,
                     "open",
                     side_effect=AssertionError("logical parser entered"),
                 ) as opened,
-                self.assertRaises(privacy.PrivacyError),
+                pytest.raises(privacy.PrivacyError),
             ):
                 privacy.scan_payload("packages/below-overlay.tar", identical)
             opened.assert_not_called()
 
+    @pytest.mark.parametrize(
+        "global_value_local_value_case",
+        range(2),
+        ids=("global-opening", "local-opening"),
+    )
+    def test_pax_allowlist_aliases_and_identical_overlay_budget_matrix_shadowed_openings(
+        self, global_value_local_value_case
+    ):
         marker = "pax-shadow-canary-q7m9tag"
-        for global_value, local_value in (
-            (marker, "public"),
-            ("public", marker),
-        ):
-            raw = _physical_tar_bytes(
-                [
-                    _pax_helper(
-                        tarfile.XGLTYPE,
-                        (("comment", global_value),),
-                    ),
-                    _pax_helper(
-                        tarfile.XHDTYPE,
-                        (("comment", local_value),),
-                    ),
-                    _ordinary_tar_record(),
-                ]
+        global_value_local_value_case_values = tuple(
+            (
+                (marker, "public"),
+                ("public", marker),
             )
-            with (
-                self.subTest(
-                    global_value=global_value,
-                    local_value=local_value,
+        )
+        assert len(global_value_local_value_case_values) == 2
+        global_value, local_value = global_value_local_value_case_values[
+            global_value_local_value_case
+        ]
+        raw = _physical_tar_bytes(
+            [
+                _pax_helper(
+                    tarfile.XGLTYPE,
+                    (("comment", global_value),),
                 ),
-                mock.patch.object(
-                    privacy.tarfile,
-                    "open",
-                    side_effect=AssertionError("logical parser entered"),
-                ) as opened,
-                self.assertRaisesRegex(privacy.PrivacyError, "private opening"),
-            ):
-                privacy.scan_payload(
-                    "packages/shadow-overlay.tar",
-                    raw,
-                    forbidden_values=(marker,),
-                )
-            opened.assert_not_called()
+                _pax_helper(
+                    tarfile.XHDTYPE,
+                    (("comment", local_value),),
+                ),
+                _ordinary_tar_record(),
+            ]
+        )
+        with (
+            mock.patch.object(
+                privacy.tarfile,
+                "open",
+                side_effect=AssertionError("logical parser entered"),
+            ) as opened,
+            pytest.raises(privacy.PrivacyError, match="private opening"),
+        ):
+            privacy.scan_payload(
+                "packages/shadow-overlay.tar",
+                raw,
+                forbidden_values=(marker,),
+            )
+        opened.assert_not_called()
 
-    def test_rejects_text_binary_and_casefolded_personal_metadata(self):
+    @pytest.mark.parametrize(
+        "raw_case",
+        range(17),
+        ids=(
+            "linux-home",
+            "macos-home",
+            "temporary",
+            "workspace",
+            "runner",
+            "file-uri",
+            "windows-home",
+            "windows-runner",
+            "windows-forward-slash",
+            "github-token",
+            "email",
+            "uuid-v1",
+            "uuid-v7",
+            "gpu-uuid",
+            "utf16-name",
+            "utf16-path",
+            "utf16-token",
+        ),
+    )
+    def test_rejects_text_binary_and_casefolded_personal_metadata(self, raw_case):
         bad = (
             b"/home/alice/project",
             b"/Users/alice/project",
@@ -4377,15 +5033,23 @@ class Issue123PrivacyScannerTest(unittest.TestCase):
             "/Users/alice/private".encode("utf-16-le"),
             "TOKEN=abcdefghijklmnopqrstuvwxyz".encode("utf-16-be"),
         )
-        for raw in bad:
-            with self.subTest(raw=raw[:30]):
-                with self.assertRaises(privacy.PrivacyError):
-                    privacy.scan_public_bytes(
-                        raw,
-                        forbidden_values=("Alice",),
-                    )
+        raw_case_values = tuple(bad)
+        assert len(raw_case_values) == 17
+        raw = raw_case_values[raw_case]
+        with pytest.raises(privacy.PrivacyError):
+            privacy.scan_public_bytes(
+                raw,
+                forbidden_values=("Alice",),
+            )
 
-    def test_recursively_scans_wheels_and_rejects_aliases_links_and_traversal(self):
+    @pytest.mark.parametrize(
+        "index_raw_case",
+        range(5),
+        ids=("traversal", "case-alias", "private-path", "symlink", "private-name"),
+    )
+    def test_recursively_scans_wheels_and_rejects_aliases_links_and_traversal(
+        self, index_raw_case
+    ):
         safe = _zip_bytes(
             [
                 ("package/__init__.py", b"value = 1\n"),
@@ -4401,17 +5065,41 @@ class Issue123PrivacyScannerTest(unittest.TestCase):
             _zip_bytes([("package/link", b"target")], symlink=True),
             _zip_bytes([("package/ALICE.txt", b"safe")]),
         )
-        for index, raw in enumerate(bad_archives):
-            with self.subTest(index=index):
-                with self.assertRaises(privacy.PrivacyError):
-                    privacy.scan_payload(
-                        "packages/unsafe.whl",
-                        raw,
-                        forbidden_values=("alice",),
-                    )
+        index_raw_case_values = tuple(enumerate(bad_archives))
+        assert len(index_raw_case_values) == 5
+        index, raw = index_raw_case_values[index_raw_case]
+        with pytest.raises(privacy.PrivacyError):
+            privacy.scan_payload(
+                "packages/unsafe.whl",
+                raw,
+                forbidden_values=("alice",),
+            )
 
-    def test_rejects_nonempty_compressed_archive_directory_bodies(self):
-        for body in (b"safe hidden bytes", b"token=x"):
+    @pytest.mark.parametrize(
+        "body_case", range(2), ids=("benign-hidden", "private-hidden")
+    )
+    def test_rejects_nonempty_compressed_archive_directory_bodies(self, body_case):
+        self._check_rejects_nonempty_compressed_archive_directory_bodies_phase(
+            phase="zip_bodies", body_case=body_case
+        )
+
+    @pytest.mark.parametrize(
+        "body_case", range(2), ids=("benign-hidden", "private-hidden")
+    )
+    def test_rejects_nonempty_compressed_archive_directory_bodies_tar_bodies(
+        self, body_case
+    ):
+        self._check_rejects_nonempty_compressed_archive_directory_bodies_phase(
+            phase="tar_bodies", body_case=body_case
+        )
+
+    def _check_rejects_nonempty_compressed_archive_directory_bodies_phase(
+        self, *, phase, body_case=None
+    ):
+        body_case_values = tuple((b"safe hidden bytes", b"token=x"))
+        assert len(body_case_values) == 2
+        body = body_case_values[body_case]
+        if phase == "zip_bodies":
             zip_stream = io.BytesIO()
             with zipfile.ZipFile(zip_stream, "w") as archive:
                 info = zipfile.ZipInfo("hidden/")
@@ -4419,22 +5107,17 @@ class Issue123PrivacyScannerTest(unittest.TestCase):
                 info.external_attr = (stat.S_IFDIR | 0o755) << 16
                 info.compress_type = zipfile.ZIP_DEFLATED
                 archive.writestr(info, body)
-            with (
-                self.subTest(archive="zip", body=body),
-                self.assertRaises(privacy.PrivacyError),
-            ):
+            with pytest.raises(privacy.PrivacyError):
                 privacy.scan_payload("packages/hidden.zip", zip_stream.getvalue())
 
+        if phase == "tar_bodies":
             tar_stream = io.BytesIO()
             with tarfile.open(fileobj=tar_stream, mode="w:gz") as archive:
                 info = tarfile.TarInfo("hidden/")
                 info.type = tarfile.DIRTYPE
                 info.size = len(body)
                 archive.addfile(info, io.BytesIO(body))
-            with (
-                self.subTest(archive="tar", body=body),
-                self.assertRaises(privacy.PrivacyError),
-            ):
+            with pytest.raises(privacy.PrivacyError):
                 privacy.scan_payload("packages/hidden.tar.gz", tar_stream.getvalue())
 
         pax_body = b"safe"
@@ -4447,9 +5130,7 @@ class Issue123PrivacyScannerTest(unittest.TestCase):
             info.size = len(pax_body)
             info.pax_headers = {"size": "0"}
             archive.addfile(info, io.BytesIO(pax_body))
-        with self.assertRaisesRegex(
-            privacy.PrivacyError, "unsupported tar size override"
-        ):
+        with pytest.raises(privacy.PrivacyError, match="unsupported tar size override"):
             privacy.scan_payload("packages/pax-hidden.tar.gz", pax_stream.getvalue())
 
         zip_stream = io.BytesIO()
@@ -4479,13 +5160,16 @@ class Issue123PrivacyScannerTest(unittest.TestCase):
         mutated[eocd + 16 : eocd + 20] = (central_offset + len(hidden)).to_bytes(
             4, "little"
         )
-        with self.assertRaisesRegex(
+        with pytest.raises(
             privacy.PrivacyError,
-            "compressed stream has trailing or inconsistent content",
+            match="compressed stream has trailing or inconsistent content",
         ):
             privacy.scan_payload("packages/zip-hidden.zip", bytes(mutated))
 
-    def test_tar_member_padding_is_scanned_and_required_to_be_zero(self):
+    @pytest.mark.parametrize(
+        "hidden_case", range(2), ids=("private-padding", "nonzero-padding")
+    )
+    def test_tar_member_padding_is_scanned_and_required_to_be_zero(self, hidden_case):
         stream = io.BytesIO()
         with tarfile.open(fileobj=stream, mode="w") as archive:
             info = tarfile.TarInfo("package/data.bin")
@@ -4495,17 +5179,16 @@ class Issue123PrivacyScannerTest(unittest.TestCase):
         with tarfile.open(fileobj=io.BytesIO(original), mode="r:") as archive:
             padding_start = archive.getmembers()[0].offset_data + 1
 
-        for hidden in (b"token=padding-secret", b"\x01"):
-            mutated = bytearray(original)
-            mutated[padding_start : padding_start + len(hidden)] = hidden
-            compressor = zlib.compressobj(wbits=16 + zlib.MAX_WBITS)
-            compressed = compressor.compress(bytes(mutated)) + compressor.flush()
-            with (
-                self.subTest(hidden=hidden),
-                self.assertRaises(privacy.PrivacyError) as caught,
-            ):
-                privacy.scan_payload("packages/padded.tar.gz", compressed)
-            self.assertNotIn("padding-secret", str(caught.exception))
+        hidden_case_values = tuple((b"token=padding-secret", b"\x01"))
+        assert len(hidden_case_values) == 2
+        hidden = hidden_case_values[hidden_case]
+        mutated = bytearray(original)
+        mutated[padding_start : padding_start + len(hidden)] = hidden
+        compressor = zlib.compressobj(wbits=16 + zlib.MAX_WBITS)
+        compressed = compressor.compress(bytes(mutated)) + compressor.flush()
+        with pytest.raises(privacy.PrivacyError) as caught:
+            privacy.scan_payload("packages/padded.tar.gz", compressed)
+        assert "padding-secret" not in str(caught.value)
 
         pax_stream = io.BytesIO()
         with tarfile.open(
@@ -4528,9 +5211,9 @@ class Issue123PrivacyScannerTest(unittest.TestCase):
         pax_raw[pax_padding : pax_padding + len(hidden)] = hidden
         compressor = zlib.compressobj(wbits=16 + zlib.MAX_WBITS)
         compressed = compressor.compress(bytes(pax_raw)) + compressor.flush()
-        with self.assertRaises(privacy.PrivacyError) as caught:
+        with pytest.raises(privacy.PrivacyError) as caught:
             privacy.scan_payload("packages/pax-padding.tar.gz", compressed)
-        self.assertNotIn("pax-padding-secret", str(caught.exception))
+        assert "pax-padding-secret" not in str(caught.value)
 
         override_body = b"safe"
         override_stream = io.BytesIO()
@@ -4541,14 +5224,19 @@ class Issue123PrivacyScannerTest(unittest.TestCase):
             info.size = len(override_body)
             info.pax_headers = {"size": "0"}
             archive.addfile(info, io.BytesIO(override_body))
-        with self.assertRaisesRegex(
-            privacy.PrivacyError, "unsupported tar size override"
-        ):
+        with pytest.raises(privacy.PrivacyError, match="unsupported tar size override"):
             privacy.scan_payload(
                 "packages/pax-size-override.tar.gz", override_stream.getvalue()
             )
 
-    def test_prefixed_and_nested_gzip_and_tar_payloads_are_detected_boundedly(self):
+    @pytest.mark.parametrize(
+        "payload_case",
+        range(4),
+        ids=("prefixed-gzip", "prefixed-tar", "v7", "prefixed-v7"),
+    )
+    def test_prefixed_and_nested_gzip_and_tar_payloads_are_detected_boundedly(
+        self, payload_case
+    ):
         stream = io.BytesIO()
         with tarfile.open(fileobj=stream, mode="w") as archive:
             info = tarfile.TarInfo("package/data.bin")
@@ -4564,21 +5252,25 @@ class Issue123PrivacyScannerTest(unittest.TestCase):
         checksum = sum(v7_raw[:512])
         v7_raw[148:156] = f"{checksum:06o}\0 ".encode("ascii")
 
-        for payload in (
-            b"launcher-stub" + gzip_raw,
-            b"launcher-stub" + tar_raw,
-            bytes(v7_raw),
-            b"launcher-stub" + bytes(v7_raw),
-        ):
-            with self.subTest(kind="opaque"), self.assertRaises(privacy.PrivacyError):
-                privacy.scan_payload(
-                    "packages/launcher.bin",
-                    payload,
-                    media_type="application/octet-stream",
-                )
+        payload_case_values = tuple(
+            (
+                b"launcher-stub" + gzip_raw,
+                b"launcher-stub" + tar_raw,
+                bytes(v7_raw),
+                b"launcher-stub" + bytes(v7_raw),
+            )
+        )
+        assert len(payload_case_values) == 4
+        payload = payload_case_values[payload_case]
+        with pytest.raises(privacy.PrivacyError):
+            privacy.scan_payload(
+                "packages/launcher.bin",
+                payload,
+                media_type="application/octet-stream",
+            )
 
         nested = _zip_bytes([("package/data.bin", b"launcher-stub" + gzip_raw)])
-        with self.assertRaisesRegex(privacy.PrivacyError, "nested archive"):
+        with pytest.raises(privacy.PrivacyError, match="nested archive"):
             privacy.scan_payload("packages/nested.zip", nested)
 
         invalid_embedded_header = b"x" * 300 + b"ustar" + b"x" * 300
@@ -4588,7 +5280,39 @@ class Issue123PrivacyScannerTest(unittest.TestCase):
             media_type="application/octet-stream",
         )
 
-    def test_rejects_assignments_short_credentials_and_private_json_keys(self):
+    @pytest.mark.parametrize(
+        "raw_case",
+        range(24),
+        ids=(
+            "hostname",
+            "user",
+            "cuda-devices",
+            "path",
+            "windows-path",
+            "lowercase-cuda",
+            "token",
+            "tokens",
+            "credentials",
+            "bearer",
+            "api-key",
+            "aws-key",
+            "host",
+            "computername",
+            "runner-name",
+            "github-actor",
+            "json-hostname",
+            "json-api-key",
+            "json-api-hyphen",
+            "json-apikey",
+            "json-aws-key",
+            "json-client-secret",
+            "json-path",
+            "json-cuda",
+        ),
+    )
+    def test_rejects_assignments_short_credentials_and_private_json_keys(
+        self, raw_case
+    ):
         bad = (
             b"HOSTNAME=runner-42",
             b"USER=alice",
@@ -4615,13 +5339,12 @@ class Issue123PrivacyScannerTest(unittest.TestCase):
             b'{"PATH":"/usr/bin"}',
             b'{"cuda_visible_devices":"0"}',
         )
-        for raw in bad:
-            with (
-                self.subTest(raw=raw),
-                self.assertRaises(privacy.PrivacyError) as caught,
-            ):
-                privacy.scan_public_bytes(raw)
-            self.assertNotIn(raw.decode("ascii"), str(caught.exception))
+        raw_case_values = tuple(bad)
+        assert len(raw_case_values) == 24
+        raw = raw_case_values[raw_case]
+        with pytest.raises(privacy.PrivacyError) as caught:
+            privacy.scan_public_bytes(raw)
+        assert raw.decode("ascii") not in str(caught.value)
 
         stream = io.BytesIO()
         with tarfile.open(
@@ -4631,45 +5354,45 @@ class Issue123PrivacyScannerTest(unittest.TestCase):
             info.pax_headers = {"uname": "private-pax-owner"}
             info.size = 4
             archive.addfile(info, io.BytesIO(b"safe"))
-        with self.assertRaises(privacy.PrivacyError) as caught:
+        with pytest.raises(privacy.PrivacyError) as caught:
             privacy.scan_payload("packages/owner-pax.tar", stream.getvalue())
-        self.assertNotIn("private-pax-owner", str(caught.exception))
+        assert "private-pax-owner" not in str(caught.value)
 
-    def test_nfkc_archive_aliases_cannot_introduce_paths_or_separators(self):
+    @pytest.mark.parametrize(
+        "name_case", range(3), ids=("parent-traversal", "slash", "backslash")
+    )
+    def test_nfkc_archive_aliases_cannot_introduce_paths_or_separators(self, name_case):
         zip_names = (
             "．．/data.bin",
             "package／data.bin",
             "package＼data.bin",
         )
-        for name in zip_names:
-            with (
-                self.subTest(archive="zip", name=name),
-                self.assertRaises(privacy.PrivacyError),
-            ):
-                privacy.scan_payload(
-                    "packages/alias.zip", _zip_bytes([(name, b"safe")])
-                )
+        name_case_values = tuple(zip_names)
+        assert len(name_case_values) == 3
+        name = name_case_values[name_case]
+        with pytest.raises(privacy.PrivacyError):
+            privacy.scan_payload("packages/alias.zip", _zip_bytes([(name, b"safe")]))
 
         stream = io.BytesIO()
         with tarfile.open(fileobj=stream, mode="w") as archive:
             info = tarfile.TarInfo("．．/data.bin")
             info.size = 4
             archive.addfile(info, io.BytesIO(b"safe"))
-        with self.assertRaises(privacy.PrivacyError):
+        with pytest.raises(privacy.PrivacyError):
             privacy.scan_payload("packages/alias.tar", stream.getvalue())
 
     def test_rejects_zip_local_central_flag_disagreement_and_strong_encryption(self):
         raw = bytearray(_zip_bytes([("package/data", b"safe")]))
         central = raw.index(b"PK\x01\x02")
         raw[central + 8] |= 0x40
-        with self.assertRaises(privacy.PrivacyError):
+        with pytest.raises(privacy.PrivacyError):
             privacy.scan_payload("packages/flags.whl", bytes(raw))
 
         raw = bytearray(_zip_bytes([("package/data", b"safe")]))
         central = raw.index(b"PK\x01\x02")
         raw[6] |= 0x40
         raw[central + 8] |= 0x40
-        with self.assertRaisesRegex(privacy.PrivacyError, "encrypted"):
+        with pytest.raises(privacy.PrivacyError, match="encrypted"):
             privacy.scan_payload("packages/encrypted.whl", bytes(raw))
 
     def test_recursively_scans_sdist_and_rejects_links(self):
@@ -4687,10 +5410,26 @@ class Issue123PrivacyScannerTest(unittest.TestCase):
             info.type = tarfile.SYMTYPE
             info.linkname = "/Users/alice/private"
             archive.addfile(info)
-        with self.assertRaises(privacy.PrivacyError):
+        with pytest.raises(privacy.PrivacyError):
             privacy.scan_payload("packages/link.tar.gz", stream.getvalue())
 
-    def test_media_suffix_signatures_withheld_roles_and_array_magic_are_closed(self):
+    @pytest.mark.parametrize(
+        "name_raw_media_type_case",
+        range(8),
+        ids=(
+            "disguised-zip",
+            "prefixed-zip",
+            "numpy-magic",
+            "private-role",
+            "operations-role",
+            "correctness-role",
+            "npz-suffix",
+            "wrong-media",
+        ),
+    )
+    def test_media_suffix_signatures_withheld_roles_and_array_magic_are_closed(
+        self, name_raw_media_type_case
+    ):
         archive = _zip_bytes([("package/data.bin", b"safe")])
         bad = (
             ("packages/disguised.bin", archive, "application/octet-stream"),
@@ -4706,23 +5445,30 @@ class Issue123PrivacyScannerTest(unittest.TestCase):
             ("packages/data.npz", archive, "application/zip"),
             ("packages/data.bin", b"safe", "application/zip"),
         )
-        for name, raw, media_type in bad:
-            with self.subTest(name=name, media_type=media_type):
-                with self.assertRaises(privacy.PrivacyError):
-                    privacy.scan_payload(name, raw, media_type=media_type)
+        name_raw_media_type_case_values = tuple(bad)
+        assert len(name_raw_media_type_case_values) == 8
+        name, raw, media_type = name_raw_media_type_case_values[
+            name_raw_media_type_case
+        ]
+        with pytest.raises(privacy.PrivacyError):
+            privacy.scan_payload(name, raw, media_type=media_type)
 
-    def test_zip_structure_comments_extras_prefix_trailing_and_nested_are_closed(self):
+    @pytest.mark.parametrize("raw_case", range(2), ids=("prefix", "trailing"))
+    def test_zip_structure_comments_extras_prefix_trailing_and_nested_are_closed(
+        self, raw_case
+    ):
         safe = _zip_bytes([("package/data.bin", b"safe")])
-        for raw in (b"prefix" + safe, safe + b"trailing"):
-            with self.subTest(kind="boundary"):
-                with self.assertRaises(privacy.PrivacyError):
-                    privacy.scan_payload("packages/unsafe.zip", raw)
+        raw_case_values = tuple((b"prefix" + safe, safe + b"trailing"))
+        assert len(raw_case_values) == 2
+        raw = raw_case_values[raw_case]
+        with pytest.raises(privacy.PrivacyError):
+            privacy.scan_payload("packages/unsafe.zip", raw)
 
         stream = io.BytesIO()
         with zipfile.ZipFile(stream, "w", compression=zipfile.ZIP_STORED) as archive:
             archive.comment = b"/Users/alice/private"
             archive.writestr("package/data.bin", b"safe")
-        with self.assertRaises(privacy.PrivacyError):
+        with pytest.raises(privacy.PrivacyError):
             privacy.scan_payload("packages/comment.zip", stream.getvalue())
 
         stream = io.BytesIO()
@@ -4731,7 +5477,7 @@ class Issue123PrivacyScannerTest(unittest.TestCase):
             leak = b"/Users/alice/private"
             info.extra = struct.pack("<HH", 0xCAFE, len(leak)) + leak
             archive.writestr(info, b"safe")
-        with self.assertRaises(privacy.PrivacyError):
+        with pytest.raises(privacy.PrivacyError):
             privacy.scan_payload("packages/extra.zip", stream.getvalue())
 
         stream = io.BytesIO()
@@ -4746,7 +5492,7 @@ class Issue123PrivacyScannerTest(unittest.TestCase):
             )
             info.extra = struct.pack("<HH", 0x7075, len(unicode_path)) + unicode_path
             archive.writestr(info, b"safe")
-        with self.assertRaisesRegex(privacy.PrivacyError, "unsupported ZIP metadata"):
+        with pytest.raises(privacy.PrivacyError, match="unsupported ZIP metadata"):
             privacy.scan_payload("packages/unicode-path.zip", stream.getvalue())
 
         inner_stream = io.BytesIO()
@@ -4755,14 +5501,21 @@ class Issue123PrivacyScannerTest(unittest.TestCase):
         ) as archive:
             archive.writestr("hidden/data.bin", b"/Users/alice/private")
         outer = _zip_bytes([("package/hidden.zip", inner_stream.getvalue())])
-        with self.assertRaisesRegex(privacy.PrivacyError, "nested archive"):
+        with pytest.raises(privacy.PrivacyError, match="nested archive"):
             privacy.scan_payload("packages/nested.zip", outer)
 
         aliased = _zip_bytes([("package/name", b"one"), ("package/name.", b"two")])
-        with self.assertRaises(privacy.PrivacyError):
+        with pytest.raises(privacy.PrivacyError):
             privacy.scan_payload("packages/alias.zip", aliased)
 
-    def test_zip_parser_exceptions_are_chain_free_and_non_leaking(self):
+    @pytest.mark.parametrize(
+        "stage_patch_case",
+        range(5),
+        ids=("constructor", "infolist", "member-read", "testzip", "close"),
+    )
+    def test_zip_parser_exceptions_are_chain_free_and_non_leaking(
+        self, stage_patch_case
+    ):
         marker = "zip-parser-canary-q7m9tag"
         member_name = f"{marker}.bin"
         safe = _zip_bytes([(member_name, b"safe")])
@@ -4774,9 +5527,9 @@ class Issue123PrivacyScannerTest(unittest.TestCase):
             "<HH", damaged, info.header_offset + 26
         )
         damaged[info.header_offset + 30 + name_size + extra_size] ^= 1
-        with self.assertRaises(privacy.PrivacyError) as caught:
+        with pytest.raises(privacy.PrivacyError) as caught:
             privacy.scan_payload("packages/crc-failure.zip", bytes(damaged))
-        _assert_sanitized_privacy_error(self, caught.exception, marker)
+        _assert_sanitized_privacy_error(caught.value, marker)
 
         fake_archive = mock.MagicMock()
         fake_archive.infolist.side_effect = RecursionError(marker)
@@ -4835,14 +5588,12 @@ class Issue123PrivacyScannerTest(unittest.TestCase):
                 ),
             ),
         )
-        for stage, patch in stages:
-            with (
-                self.subTest(stage=stage),
-                patch,
-                self.assertRaises(privacy.PrivacyError) as caught,
-            ):
-                privacy.scan_payload("packages/library-failure.zip", safe)
-            _assert_sanitized_privacy_error(self, caught.exception, marker)
+        stage_patch_case_values = tuple(stages)
+        assert len(stage_patch_case_values) == 5
+        stage, patch = stage_patch_case_values[stage_patch_case]
+        with patch, pytest.raises(privacy.PrivacyError) as caught:
+            privacy.scan_payload("packages/library-failure.zip", safe)
+        _assert_sanitized_privacy_error(caught.value, marker)
 
         primary_close_failure = CloseFailureArchive(zipfile.ZipFile(io.BytesIO(safe)))
         with (
@@ -4856,12 +5607,12 @@ class Issue123PrivacyScannerTest(unittest.TestCase):
                 "ZipFile",
                 return_value=primary_close_failure,
             ),
-            self.assertRaisesRegex(
-                privacy.PrivacyError, "safe primary rejection"
+            pytest.raises(
+                privacy.PrivacyError, match="safe primary rejection"
             ) as caught,
         ):
             privacy.scan_payload("packages/primary.zip", safe)
-        _assert_sanitized_privacy_error(self, caught.exception, marker)
+        _assert_sanitized_privacy_error(caught.value, marker)
 
         with (
             mock.patch.object(
@@ -4869,18 +5620,18 @@ class Issue123PrivacyScannerTest(unittest.TestCase):
                 "unpack_from",
                 side_effect=struct.error(marker),
             ),
-            self.assertRaises(privacy.PrivacyError) as caught,
+            pytest.raises(privacy.PrivacyError) as caught,
         ):
             privacy._zip_unpack("<H", b"\0\0", 0, "ZIP metadata is malformed")
-        _assert_sanitized_privacy_error(self, caught.exception, marker)
+        _assert_sanitized_privacy_error(caught.value, marker)
 
-        with self.assertRaises(privacy.PrivacyError) as caught:
+        with pytest.raises(privacy.PrivacyError) as caught:
             privacy._zip_decode(
                 b"\xff" + marker.encode(),
                 "utf-8",
                 "ZIP name encoding is invalid",
             )
-        _assert_sanitized_privacy_error(self, caught.exception, marker)
+        _assert_sanitized_privacy_error(caught.value, marker)
 
         deflate = io.BytesIO()
         with zipfile.ZipFile(deflate, "w", compression=zipfile.ZIP_DEFLATED) as archive:
@@ -4891,17 +5642,45 @@ class Issue123PrivacyScannerTest(unittest.TestCase):
                 "decompressobj",
                 side_effect=zlib.error(marker),
             ),
-            self.assertRaises(privacy.PrivacyError) as caught,
+            pytest.raises(privacy.PrivacyError) as caught,
         ):
             privacy.scan_payload("packages/deflate-failure.zip", deflate.getvalue())
-        _assert_sanitized_privacy_error(self, caught.exception, marker)
+        _assert_sanitized_privacy_error(caught.value, marker)
 
-    def test_strict_and_contextual_json_exceptions_are_fully_sanitized(self):
+    @pytest.mark.parametrize(
+        "stage_name_raw_parser_raw_media_type_case",
+        range(4),
+        ids=("zip", "wheel", "tar", "gzip"),
+    )
+    def test_strict_and_contextual_json_exceptions_are_fully_sanitized(
+        self, stage_name_raw_parser_raw_media_type_case
+    ):
+        self._check_strict_and_contextual_json_exceptions_are_fully_sanitized_phase(
+            phase="malformed_bytes",
+            stage_name_raw_parser_raw_media_type_case=stage_name_raw_parser_raw_media_type_case,
+        )
+
+    @pytest.mark.parametrize(
+        "stage_name_raw_parser_raw_media_type_case",
+        range(4),
+        ids=("zip", "wheel", "tar", "gzip"),
+    )
+    def test_strict_and_contextual_json_exceptions_are_fully_sanitized_parser_errors(
+        self, stage_name_raw_parser_raw_media_type_case
+    ):
+        self._check_strict_and_contextual_json_exceptions_are_fully_sanitized_phase(
+            phase="parser_errors",
+            stage_name_raw_parser_raw_media_type_case=stage_name_raw_parser_raw_media_type_case,
+        )
+
+    def _check_strict_and_contextual_json_exceptions_are_fully_sanitized_phase(
+        self, *, phase, stage_name_raw_parser_raw_media_type_case=None
+    ):
         marker = "json-parser-canary-q7m9tag"
         malformed = b'{"public":"' + b"\xff" + marker.encode() + b'"}'
-        with self.assertRaises(privacy.PrivacyError) as caught:
+        with pytest.raises(privacy.PrivacyError) as caught:
             privacy._strict_json(malformed, "private JSON")
-        _assert_sanitized_privacy_error(self, caught.exception, marker)
+        _assert_sanitized_privacy_error(caught.value, marker)
 
         with (
             mock.patch.object(
@@ -4909,10 +5688,10 @@ class Issue123PrivacyScannerTest(unittest.TestCase):
                 "loads",
                 side_effect=RecursionError(marker),
             ),
-            self.assertRaises(privacy.PrivacyError) as caught,
+            pytest.raises(privacy.PrivacyError) as caught,
         ):
             privacy._strict_json(b"{}", "private JSON")
-        _assert_sanitized_privacy_error(self, caught.exception, marker)
+        _assert_sanitized_privacy_error(caught.value, marker)
 
         valid = b'{"public":"safe"}'
         zip_raw = _zip_bytes([("package/config.json", malformed)])
@@ -4953,25 +5732,27 @@ class Issue123PrivacyScannerTest(unittest.TestCase):
                 "application/gzip",
             ),
         )
-        for stage, name, raw, parser_raw, media_type in containers:
-            with (
-                self.subTest(stage=stage, failure="decode"),
-                self.assertRaises(privacy.PrivacyError) as caught,
-            ):
+        stage_name_raw_parser_raw_media_type_case_values = tuple(containers)
+        assert len(stage_name_raw_parser_raw_media_type_case_values) == 4
+        stage, name, raw, parser_raw, media_type = (
+            stage_name_raw_parser_raw_media_type_case_values[
+                stage_name_raw_parser_raw_media_type_case
+            ]
+        )
+        if phase == "malformed_bytes":
+            with pytest.raises(privacy.PrivacyError) as caught:
                 privacy.scan_payload(name, raw, media_type=media_type)
-            _assert_sanitized_privacy_error(self, caught.exception, marker)
+            _assert_sanitized_privacy_error(caught.value, marker)
 
+        if phase == "parser_errors":
             with (
-                self.subTest(stage=stage, failure="parser"),
                 mock.patch.object(
-                    privacy.json,
-                    "loads",
-                    side_effect=ValueError(marker),
+                    privacy.json, "loads", side_effect=ValueError(marker)
                 ),
-                self.assertRaises(privacy.PrivacyError) as caught,
+                pytest.raises(privacy.PrivacyError) as caught,
             ):
                 privacy.scan_payload(name, parser_raw, media_type=media_type)
-            _assert_sanitized_privacy_error(self, caught.exception, marker)
+            _assert_sanitized_privacy_error(caught.value, marker)
 
     def test_wheel_source_schema_words_are_safe_but_json_identity_values_are_not(self):
         safe = _zip_bytes(
@@ -4982,10 +5763,28 @@ class Issue123PrivacyScannerTest(unittest.TestCase):
         unsafe = _zip_bytes(
             [("package/config.json", _json_bytes({"hostname": "private-host"}))]
         )
-        with self.assertRaisesRegex(privacy.PrivacyError, "private metadata"):
+        with pytest.raises(privacy.PrivacyError, match="private metadata"):
             privacy.scan_payload("packages/metadata.whl", unsafe)
 
-    def test_benign_pax_and_gnu_names_reconcile_without_getmembers(self):
+    @pytest.mark.parametrize(
+        "name_raw_case",
+        range(12),
+        ids=(
+            "local-pax",
+            "global-pax",
+            "identical-pax",
+            "path-pax",
+            "path-pax-gzip",
+            "long-gnu",
+            "identical-mtime",
+            "identical-uid",
+            "identical-gid",
+            "identical-uname",
+            "identical-gname",
+            "identical-hdrcharset",
+        ),
+    )
+    def test_benign_pax_and_gnu_names_reconcile_without_getmembers(self, name_raw_case):
         local_stream = io.BytesIO()
         with tarfile.open(
             fileobj=local_stream, mode="w", format=tarfile.PAX_FORMAT
@@ -5089,9 +5888,10 @@ class Issue123PrivacyScannerTest(unittest.TestCase):
                 side_effect=AssertionError("filesystem extraction"),
             ) as extractall,
         ):
-            for name, raw in archives + identical_allowed:
-                with self.subTest(name=name):
-                    privacy.scan_payload(name, raw)
+            name_raw_case_values = tuple(archives + identical_allowed)
+            assert len(name_raw_case_values) == 12
+            name, raw = name_raw_case_values[name_raw_case]
+            privacy.scan_payload(name, raw)
         getmembers.assert_not_called()
         extract.assert_not_called()
         extractall.assert_not_called()
@@ -5102,7 +5902,7 @@ class Issue123PrivacyScannerTest(unittest.TestCase):
                 "open",
                 side_effect=AssertionError("logical parser entered"),
             ) as opened,
-            self.assertRaisesRegex(privacy.PrivacyError, "unsupported global PAX path"),
+            pytest.raises(privacy.PrivacyError, match="unsupported global PAX path"),
         ):
             privacy.scan_payload("packages/global-path-pax.tar", shadowed_path)
         opened.assert_not_called()
@@ -5110,7 +5910,7 @@ class Issue123PrivacyScannerTest(unittest.TestCase):
         with mock.patch.object(privacy, "PRIVACY_TEXT_INPUT_CHUNK_BYTES", 519):
             privacy.scan_payload("packages/path-pax.tar", pax_path_stream.getvalue())
 
-        with self.assertRaises(privacy.PrivacyError):
+        with pytest.raises(privacy.PrivacyError):
             privacy.scan_public_bytes(b"path=package/public.bin")
 
         with (
@@ -5119,7 +5919,7 @@ class Issue123PrivacyScannerTest(unittest.TestCase):
                 "open",
                 side_effect=AssertionError("logical parser entered"),
             ) as opened,
-            self.assertRaisesRegex(privacy.PrivacyError, "private opening"),
+            pytest.raises(privacy.PrivacyError, match="private opening"),
         ):
             privacy.scan_payload(
                 "packages/path-pax.tar",
@@ -5128,7 +5928,32 @@ class Issue123PrivacyScannerTest(unittest.TestCase):
             )
         opened.assert_not_called()
 
-    def test_parser_active_pax_controls_are_rejected_before_tarfile_open(self):
+    @pytest.mark.parametrize(
+        "key_value_expected_case",
+        range(17),
+        ids=(
+            "size",
+            "linkpath",
+            "sparse-map",
+            "sparse-size",
+            "sparse-major",
+            "sparse-minor",
+            "sparse-realsize",
+            "schily-realsize",
+            "sparse-filetype",
+            "schily-xattr",
+            "libarchive-xattr",
+            "security-host",
+            "HOST",
+            "binary-charset",
+            "timestamp-exponent",
+            "timestamp-precision",
+            "timestamp-overflow",
+        ),
+    )
+    def test_parser_active_pax_controls_are_rejected_before_tarfile_open(
+        self, key_value_expected_case
+    ):
         controls = (
             ("size", "4", "unsupported tar size override"),
             ("linkpath", "package/other.bin", "unsupported link path"),
@@ -5156,31 +5981,77 @@ class Issue123PrivacyScannerTest(unittest.TestCase):
             ("mtime", "1.1234567890", "invalid tar timestamp"),
             ("mtime", "9223372036854775808", "invalid tar timestamp"),
         )
-        for key, value, expected in controls:
-            raw = _physical_tar_bytes(
-                [
-                    _pax_helper(tarfile.XGLTYPE, ((key, value),)),
-                    _pax_helper(tarfile.XGLTYPE, ((key, ""),)),
-                    _ordinary_tar_record(),
-                ]
-            )
-            with (
-                self.subTest(key=key),
-                mock.patch.object(
-                    privacy.tarfile,
-                    "open",
-                    side_effect=AssertionError("logical parser entered"),
-                ) as opened,
-                self.assertRaisesRegex(privacy.PrivacyError, expected) as caught,
-            ):
-                privacy.scan_payload("packages/structural.tar", raw)
-            opened.assert_not_called()
-            self.assertNotIn(
-                "private-shadow-marker",
-                " ".join(_exception_messages(caught.exception)),
-            )
+        key_value_expected_case_values = tuple(controls)
+        assert len(key_value_expected_case_values) == 17
+        key, value, expected = key_value_expected_case_values[key_value_expected_case]
+        raw = _physical_tar_bytes(
+            [
+                _pax_helper(tarfile.XGLTYPE, ((key, value),)),
+                _pax_helper(tarfile.XGLTYPE, ((key, ""),)),
+                _ordinary_tar_record(),
+            ]
+        )
+        with (
+            mock.patch.object(
+                privacy.tarfile,
+                "open",
+                side_effect=AssertionError("logical parser entered"),
+            ) as opened,
+            pytest.raises(privacy.PrivacyError, match=expected) as caught,
+        ):
+            privacy.scan_payload("packages/structural.tar", raw)
+        opened.assert_not_called()
+        assert "private-shadow-marker" not in " ".join(
+            _exception_messages(caught.value)
+        )
 
-    def test_contiguous_tar_scan_closes_physical_record_boundaries(self):
+    @pytest.mark.parametrize(
+        "name_raw_case",
+        range(6),
+        ids=(
+            "header-body-tar",
+            "header-body-gzip",
+            "body-header-tar",
+            "body-header-gzip",
+            "header-header-tar",
+            "header-header-gzip",
+        ),
+    )
+    def test_contiguous_tar_scan_closes_physical_record_boundaries(self, name_raw_case):
+        self._check_contiguous_tar_scan_closes_physical_record_boundaries_phase(
+            phase="record_boundaries", name_raw_case=name_raw_case
+        )
+
+    @pytest.mark.parametrize(
+        "padding_case", range(2), ids=("padding-tar", "padding-gzip")
+    )
+    def test_contiguous_tar_scan_closes_physical_record_boundaries_padding(
+        self, padding_case
+    ):
+        self._check_contiguous_tar_scan_closes_physical_record_boundaries_phase(
+            phase="padding", padding_case=padding_case
+        )
+
+    @pytest.mark.parametrize(
+        "key_value_expected_case",
+        range(2),
+        ids=("path-assignment", "comment-assignment"),
+    )
+    def test_contiguous_tar_scan_closes_physical_record_boundaries_pax_headers(
+        self, key_value_expected_case
+    ):
+        self._check_contiguous_tar_scan_closes_physical_record_boundaries_phase(
+            phase="pax_headers", key_value_expected_case=key_value_expected_case
+        )
+
+    def _check_contiguous_tar_scan_closes_physical_record_boundaries_phase(
+        self,
+        *,
+        phase,
+        padding_case=None,
+        name_raw_case=None,
+        key_value_expected_case=None,
+    ):
         header_body = bytearray(
             _physical_tar_bytes(
                 [_ordinary_tar_record("package/header-body.bin", b"alice/public")]
@@ -5190,7 +6061,7 @@ class Issue123PrivacyScannerTest(unittest.TestCase):
         header_body[148:156] = b" " * 8
         checksum = sum(header_body[:512])
         header_body[148:156] = f"{checksum:06o}\0 ".encode("ascii")
-        self.assertTrue(privacy._tar_checksum_matches(bytes(header_body[:512])))
+        assert privacy._tar_checksum_matches(bytes(header_body[:512]))
 
         body_header = _physical_tar_bytes(
             [
@@ -5213,7 +6084,7 @@ class Issue123PrivacyScannerTest(unittest.TestCase):
         header_header[148:156] = b" " * 8
         checksum = sum(header_header[:512])
         header_header[148:156] = f"{checksum:06o}\0 ".encode("ascii")
-        self.assertTrue(privacy._tar_checksum_matches(bytes(header_header[:512])))
+        assert privacy._tar_checksum_matches(bytes(header_header[:512]))
         boundary_cases = (
             ("header-body.tar", bytes(header_body)),
             ("header-body.tar.gz", _gzip_bytes(bytes(header_body))),
@@ -5222,20 +6093,22 @@ class Issue123PrivacyScannerTest(unittest.TestCase):
             ("header-header.tar", bytes(header_header)),
             ("header-header.tar.gz", _gzip_bytes(bytes(header_header))),
         )
-        for name, raw in boundary_cases:
+        if phase == "record_boundaries":
+            name_raw_case_values = tuple(boundary_cases)
+            assert len(name_raw_case_values) == 6
+            name, raw = name_raw_case_values[name_raw_case]
             with (
-                self.subTest(name=name),
                 mock.patch.object(
                     privacy.tarfile,
                     "open",
                     side_effect=AssertionError("logical parser entered"),
                 ) as opened,
-                self.assertRaises(privacy.PrivacyError) as caught,
+                pytest.raises(privacy.PrivacyError) as caught,
             ):
                 privacy.scan_payload(f"packages/{name}", raw)
             opened.assert_not_called()
-            self.assertNotIn("alice", str(caught.exception))
-            self.assertNotIn("token=x", str(caught.exception))
+            assert "alice" not in str(caught.value)
+            assert "token=x" not in str(caught.value)
 
         with (
             mock.patch.object(privacy, "PRIVACY_TEXT_INPUT_CHUNK_BYTES", 512),
@@ -5244,30 +6117,34 @@ class Issue123PrivacyScannerTest(unittest.TestCase):
                 "open",
                 side_effect=AssertionError("logical parser entered"),
             ) as opened,
-            self.assertRaises(privacy.PrivacyError),
+            pytest.raises(privacy.PrivacyError),
         ):
             privacy.scan_payload("packages/rolling-boundary.tar", bytes(header_body))
         opened.assert_not_called()
 
-        padding_boundary = _physical_tar_bytes(
-            [
-                _ordinary_tar_record("package/padded.bin", b"Q"),
-                _ordinary_tar_record("tail", b"safe"),
-            ]
-        )
-        padding_opening = "Q" + "\0" * 511 + "tail"
-        for name, raw in (
-            ("padding-boundary.tar", padding_boundary),
-            ("padding-boundary.tar.gz", _gzip_bytes(padding_boundary)),
-        ):
+        if phase == "padding":
+            padding_boundary = _physical_tar_bytes(
+                [
+                    _ordinary_tar_record("package/padded.bin", b"Q"),
+                    _ordinary_tar_record("tail", b"safe"),
+                ]
+            )
+            padding_opening = "Q" + "\0" * 511 + "tail"
+            padding_case_values = tuple(
+                (
+                    ("padding-boundary.tar", padding_boundary),
+                    ("padding-boundary.tar.gz", _gzip_bytes(padding_boundary)),
+                )
+            )
+            assert len(padding_case_values) == 2
+            name, raw = padding_case_values[padding_case]
             with (
-                self.subTest(name=name),
                 mock.patch.object(
                     privacy.tarfile,
                     "open",
                     side_effect=AssertionError("logical parser entered"),
                 ) as opened,
-                self.assertRaisesRegex(privacy.PrivacyError, "private opening"),
+                pytest.raises(privacy.PrivacyError, match="private opening"),
             ):
                 privacy.scan_payload(
                     f"packages/{name}",
@@ -5285,26 +6162,31 @@ class Issue123PrivacyScannerTest(unittest.TestCase):
                 "open",
                 side_effect=AssertionError("logical parser entered"),
             ) as opened,
-            self.assertRaisesRegex(
-                privacy.PrivacyError, "environment or identity assignment"
+            pytest.raises(
+                privacy.PrivacyError, match="environment or identity assignment"
             ),
         ):
             privacy.scan_payload("packages/ordinary-path.tar", ordinary_path_assignment)
         opened.assert_not_called()
 
-        pax_values = (
-            (
-                "path",
-                "package/HOST=synthetic-node.bin",
-                "environment or identity assignment",
-            ),
-            (
-                "comment",
-                "path=package/public.bin",
-                "environment or identity assignment",
-            ),
-        )
-        for key, value, expected in pax_values:
+        if phase == "pax_headers":
+            pax_values = (
+                (
+                    "path",
+                    "package/HOST=synthetic-node.bin",
+                    "environment or identity assignment",
+                ),
+                (
+                    "comment",
+                    "path=package/public.bin",
+                    "environment or identity assignment",
+                ),
+            )
+            key_value_expected_case_values = tuple(pax_values)
+            assert len(key_value_expected_case_values) == 2
+            key, value, expected = key_value_expected_case_values[
+                key_value_expected_case
+            ]
             raw = _physical_tar_bytes(
                 [
                     _pax_helper(tarfile.XHDTYPE, ((key, value),)),
@@ -5312,18 +6194,20 @@ class Issue123PrivacyScannerTest(unittest.TestCase):
                 ]
             )
             with (
-                self.subTest(key=key),
                 mock.patch.object(
                     privacy.tarfile,
                     "open",
                     side_effect=AssertionError("logical parser entered"),
                 ) as opened,
-                self.assertRaisesRegex(privacy.PrivacyError, expected),
+                pytest.raises(privacy.PrivacyError, match=expected),
             ):
                 privacy.scan_payload("packages/pax-value.tar", raw)
             opened.assert_not_called()
 
-    def test_effective_pax_association_budget_precedes_member_copy_and_open(self):
+    @pytest.mark.parametrize("local_items_case", range(2), ids=("updated", "identical"))
+    def test_effective_pax_association_budget_precedes_member_copy_and_open(
+        self, local_items_case
+    ):
         raw = _physical_tar_bytes(
             [
                 _pax_helper(
@@ -5343,33 +6227,35 @@ class Issue123PrivacyScannerTest(unittest.TestCase):
                 "open",
                 side_effect=AssertionError("logical parser entered"),
             ) as opened,
-            self.assertRaisesRegex(
-                privacy.PrivacyError, "effective PAX associations exceed their bound"
+            pytest.raises(
+                privacy.PrivacyError,
+                match="effective PAX associations exceed their bound",
             ),
         ):
             privacy.scan_payload("packages/pax-product.tar", raw)
         opened.assert_not_called()
-        self.assertEqual(merged.call_count, 2)
+        assert merged.call_count == 2
 
-        for local_items in (
-            (("comment", "updated"),),
-            (("comment", "public"),),
-        ):
-            bounded_overlay = _physical_tar_bytes(
-                [
-                    _pax_helper(
-                        tarfile.XGLTYPE,
-                        (("comment", "public"), ("mtime", "1")),
-                    ),
-                    _pax_helper(tarfile.XHDTYPE, local_items),
-                    _ordinary_tar_record(),
-                ]
+        local_items_case_values = tuple(
+            (
+                (("comment", "updated"),),
+                (("comment", "public"),),
             )
-            with (
-                self.subTest(local_items=local_items),
-                mock.patch.object(privacy, "MAX_TAR_EFFECTIVE_PAX_ASSOCIATIONS", 2),
-            ):
-                privacy.scan_payload("packages/pax-overlay.tar", bounded_overlay)
+        )
+        assert len(local_items_case_values) == 2
+        local_items = local_items_case_values[local_items_case]
+        bounded_overlay = _physical_tar_bytes(
+            [
+                _pax_helper(
+                    tarfile.XGLTYPE,
+                    (("comment", "public"), ("mtime", "1")),
+                ),
+                _pax_helper(tarfile.XHDTYPE, local_items),
+                _ordinary_tar_record(),
+            ]
+        )
+        with mock.patch.object(privacy, "MAX_TAR_EFFECTIVE_PAX_ASSOCIATIONS", 2):
+            privacy.scan_payload("packages/pax-overlay.tar", bounded_overlay)
 
         new_local_key = _physical_tar_bytes(
             [
@@ -5392,15 +6278,47 @@ class Issue123PrivacyScannerTest(unittest.TestCase):
                 "open",
                 side_effect=AssertionError("logical parser entered"),
             ) as opened,
-            self.assertRaisesRegex(
-                privacy.PrivacyError, "effective PAX associations exceed their bound"
+            pytest.raises(
+                privacy.PrivacyError,
+                match="effective PAX associations exceed their bound",
             ),
         ):
             privacy.scan_payload("packages/pax-new-key.tar", new_local_key)
         opened.assert_not_called()
-        self.assertEqual(merged.call_count, 1)
+        assert merged.call_count == 1
 
-    def test_extraction_active_vendor_pax_metadata_precedes_tarfile_open(self):
+    @pytest.mark.parametrize(
+        "key_value_case",
+        range(23),
+        ids=(
+            "SUN.holesdata",
+            "SCHILY.acl.access",
+            "SCHILY.acl.default",
+            "SCHILY.acl.ace",
+            "RHT.security.selinux",
+            "LIBARCHIVE.symlinktype",
+            "SCHILY.devmajor",
+            "SCHILY.devminor",
+            "SCHILY.filetype",
+            "SCHILY.ino",
+            "SCHILY.dev",
+            "SCHILY.nlink",
+            "SCHILY.nlinks",
+            "SUN.devmajor",
+            "SUN.devminor",
+            "LIBARCHIVE.creationtime",
+            "GNU.dumpdir",
+            "RHT.unknown",
+            "realtime.any",
+            "atime",
+            "ctime",
+            "charset",
+            "note",
+        ),
+    )
+    def test_extraction_active_vendor_pax_metadata_precedes_tarfile_open(
+        self, key_value_case
+    ):
         vendor_fields = (
             ("SUN.holesdata", "0"),
             ("SCHILY.acl.access", "public"),
@@ -5426,37 +6344,40 @@ class Issue123PrivacyScannerTest(unittest.TestCase):
             ("charset", "UTF-8"),
             ("note", "safe"),
         )
-        for key, value in vendor_fields:
-            raw = _physical_tar_bytes(
-                [
-                    _pax_helper(tarfile.XHDTYPE, ((key, value),)),
-                    _ordinary_tar_record(),
-                ]
-            )
-            with (
-                self.subTest(key=key),
-                mock.patch.object(
-                    privacy.tarfile,
-                    "open",
-                    side_effect=AssertionError("logical parser entered"),
-                ) as opened,
-                self.assertRaisesRegex(
-                    privacy.PrivacyError, "unsupported tar metadata override"
-                ) as caught,
-            ):
-                privacy.scan_payload("packages/vendor.tar", raw)
-            opened.assert_not_called()
-            self.assertNotIn(
-                "private-vendor-marker",
-                " ".join(_exception_messages(caught.exception)),
-            )
+        key_value_case_values = tuple(vendor_fields)
+        assert len(key_value_case_values) == 23
+        key, value = key_value_case_values[key_value_case]
+        raw = _physical_tar_bytes(
+            [
+                _pax_helper(tarfile.XHDTYPE, ((key, value),)),
+                _ordinary_tar_record(),
+            ]
+        )
+        with (
+            mock.patch.object(
+                privacy.tarfile,
+                "open",
+                side_effect=AssertionError("logical parser entered"),
+            ) as opened,
+            pytest.raises(
+                privacy.PrivacyError, match="unsupported tar metadata override"
+            ) as caught,
+        ):
+            privacy.scan_payload("packages/vendor.tar", raw)
+        opened.assert_not_called()
+        assert "private-vendor-marker" not in " ".join(
+            _exception_messages(caught.value)
+        )
 
-    def test_gzip_expansion_ratio_is_bounded_before_physical_tar_parsing(self):
+    @pytest.mark.parametrize(
+        "malformed_case", range(3), ids=("concatenated", "trailing", "truncated")
+    )
+    def test_gzip_expansion_ratio_is_bounded_before_physical_tar_parsing(
+        self, malformed_case
+    ):
         tar_raw = _physical_tar_bytes([_ordinary_tar_record(body=b"\0" * 64 * 1024)])
         compressed = _gzip_bytes(tar_raw)
-        self.assertGreater(
-            len(tar_raw), len(compressed) * privacy.MAX_COMPRESSION_RATIO
-        )
+        assert len(tar_raw) > len(compressed) * privacy.MAX_COMPRESSION_RATIO
         privacy.scan_payload("packages/floor-compatible.tar.gz", compressed)
 
         with (
@@ -5467,7 +6388,7 @@ class Issue123PrivacyScannerTest(unittest.TestCase):
                 "_scan_tar_physical_records",
                 side_effect=AssertionError("physical parser entered"),
             ) as physical_scan,
-            self.assertRaisesRegex(privacy.PrivacyError, "oversized"),
+            pytest.raises(privacy.PrivacyError, match="oversized"),
         ):
             privacy.scan_payload("packages/ratio-bomb.tar.gz", compressed)
         physical_scan.assert_not_called()
@@ -5481,7 +6402,7 @@ class Issue123PrivacyScannerTest(unittest.TestCase):
                 "_scan_tar_physical_records",
                 side_effect=AssertionError("physical parser entered"),
             ) as physical_scan,
-            self.assertRaisesRegex(privacy.PrivacyError, "oversized"),
+            pytest.raises(privacy.PrivacyError, match="oversized"),
         ):
             privacy.scan_payload(
                 "packages/trailing-ratio-bomb.tar.gz", inflated_denominator
@@ -5523,30 +6444,32 @@ class Issue123PrivacyScannerTest(unittest.TestCase):
             ),
         ):
             privacy.scan_payload("packages/chunked.tar.gz", safe_gzip)
-        self.assertGreater(len(input_sizes), 1)
-        self.assertTrue(all(0 < size <= 7 for size in input_sizes))
-        self.assertTrue(all(0 < limit <= 29 for limit in output_limits))
-        self.assertEqual(flush_calls, [])
+        assert len(input_sizes) > 1
+        assert all((0 < size <= 7 for size in input_sizes))
+        assert all((0 < limit <= 29 for limit in output_limits))
+        assert flush_calls == []
 
-        for malformed in (
-            safe_gzip + safe_gzip,
-            safe_gzip + b"trailer-marker",
-            safe_gzip[:-1],
+        malformed_case_values = tuple(
+            (
+                safe_gzip + safe_gzip,
+                safe_gzip + b"trailer-marker",
+                safe_gzip[:-1],
+            )
+        )
+        assert len(malformed_case_values) == 3
+        malformed = malformed_case_values[malformed_case]
+        with (
+            mock.patch.object(
+                privacy,
+                "_scan_tar_physical_records",
+                side_effect=AssertionError("physical parser entered"),
+            ) as physical_scan,
+            pytest.raises(
+                privacy.PrivacyError, match="trailing, concatenated, or oversized"
+            ),
         ):
-            with (
-                self.subTest(malformed_length=len(malformed)),
-                mock.patch.object(
-                    privacy,
-                    "_scan_tar_physical_records",
-                    side_effect=AssertionError("physical parser entered"),
-                ) as physical_scan,
-                self.assertRaisesRegex(
-                    privacy.PrivacyError,
-                    "trailing, concatenated, or oversized",
-                ),
-            ):
-                privacy.scan_payload("packages/malformed.tar.gz", malformed)
-            physical_scan.assert_not_called()
+            privacy.scan_payload("packages/malformed.tar.gz", malformed)
+        physical_scan.assert_not_called()
 
         class FailingDecompressor:
             def decompress(self, _data, _max_length):
@@ -5556,17 +6479,28 @@ class Issue123PrivacyScannerTest(unittest.TestCase):
             mock.patch.object(
                 privacy.zlib, "decompressobj", return_value=FailingDecompressor()
             ),
-            self.assertRaisesRegex(
-                privacy.PrivacyError, "is not a valid gzip payload"
+            pytest.raises(
+                privacy.PrivacyError, match="is not a valid gzip payload"
             ) as caught,
         ):
             privacy.scan_payload("packages/invalid.tar.gz", safe_gzip)
-        self.assertNotIn(
-            "private-gzip-marker",
-            " ".join(_exception_messages(caught.exception)),
-        )
+        assert "private-gzip-marker" not in " ".join(_exception_messages(caught.value))
 
-    def test_tar_helper_budgets_and_physical_member_bound_precede_open(self):
+    @pytest.mark.parametrize(
+        "expected_raw_limits_case",
+        range(6),
+        ids=(
+            "pax-bytes",
+            "gnu-name-bytes",
+            "total-helper-bytes",
+            "pax-records",
+            "consecutive-helpers",
+            "member-count",
+        ),
+    )
+    def test_tar_helper_budgets_and_physical_member_bound_precede_open(
+        self, expected_raw_limits_case
+    ):
         pax_one = _pax_helper(tarfile.XGLTYPE, (("comment", "one"),))
         pax_two = _pax_helper(tarfile.XGLTYPE, (("mtime", "2"),))
         pax_size = len(pax_one[2])
@@ -5613,30 +6547,49 @@ class Issue123PrivacyScannerTest(unittest.TestCase):
                 {"MAX_ARCHIVE_MEMBERS": 1},
             ),
         )
-        for expected, raw, limits in cases:
-            patches = [
-                mock.patch.object(privacy, attribute, value)
-                for attribute, value in limits.items()
-            ]
-            for patch in patches:
-                patch.start()
-            try:
-                with (
-                    self.subTest(expected=expected),
-                    mock.patch.object(
-                        privacy.tarfile,
-                        "open",
-                        side_effect=AssertionError("logical parser entered"),
-                    ) as opened,
-                    self.assertRaisesRegex(privacy.PrivacyError, expected),
-                ):
-                    privacy.scan_payload("packages/bounded.tar", raw)
-                opened.assert_not_called()
-            finally:
-                for patch in reversed(patches):
-                    patch.stop()
+        expected_raw_limits_case_values = tuple(cases)
+        assert len(expected_raw_limits_case_values) == 6
+        expected, raw, limits = expected_raw_limits_case_values[
+            expected_raw_limits_case
+        ]
+        patches = [
+            mock.patch.object(privacy, attribute, value)
+            for attribute, value in limits.items()
+        ]
+        for patch in patches:
+            patch.start()
+        try:
+            with (
+                mock.patch.object(
+                    privacy.tarfile,
+                    "open",
+                    side_effect=AssertionError("logical parser entered"),
+                ) as opened,
+                pytest.raises(privacy.PrivacyError, match=expected),
+            ):
+                privacy.scan_payload("packages/bounded.tar", raw)
+            opened.assert_not_called()
+        finally:
+            for patch in reversed(patches):
+                patch.stop()
 
-    def test_malformed_and_conflicting_tar_helpers_fail_before_open(self):
+    @pytest.mark.parametrize(
+        "index_raw_case",
+        range(8),
+        ids=(
+            "empty-pax",
+            "orphan-local",
+            "orphan-longname",
+            "orphan-global",
+            "duplicate-local",
+            "conflicting-names",
+            "longlink",
+            "sparse",
+        ),
+    )
+    def test_malformed_and_conflicting_tar_helpers_fail_before_open(
+        self, index_raw_case
+    ):
         local = _pax_helper(tarfile.XHDTYPE, (("comment", "public"),))
         global_same = _pax_helper(tarfile.XGLTYPE, (("comment", "public"),))
         path = _pax_helper(tarfile.XHDTYPE, (("path", "package/pax-name.bin"),))
@@ -5664,20 +6617,28 @@ class Issue123PrivacyScannerTest(unittest.TestCase):
                 ]
             ),
         )
-        for index, raw in enumerate(invalid):
-            with (
-                self.subTest(index=index),
-                mock.patch.object(
-                    privacy.tarfile,
-                    "open",
-                    side_effect=AssertionError("logical parser entered"),
-                ) as opened,
-                self.assertRaises(privacy.PrivacyError),
-            ):
-                privacy.scan_payload("packages/helpers.tar", raw)
-            opened.assert_not_called()
+        index_raw_case_values = tuple(enumerate(invalid))
+        assert len(index_raw_case_values) == 8
+        index, raw = index_raw_case_values[index_raw_case]
+        with (
+            mock.patch.object(
+                privacy.tarfile,
+                "open",
+                side_effect=AssertionError("logical parser entered"),
+            ) as opened,
+            pytest.raises(privacy.PrivacyError),
+        ):
+            privacy.scan_payload("packages/helpers.tar", raw)
+        opened.assert_not_called()
 
-    def test_tar_logical_members_reconcile_with_the_immutable_ledger(self):
+    @pytest.mark.parametrize(
+        "changed_case",
+        range(7),
+        ids=("name", "offset", "size", "type", "pax", "sparse", "wrong-member"),
+    )
+    def test_tar_logical_members_reconcile_with_the_immutable_ledger(
+        self, changed_case
+    ):
         raw = _physical_tar_bytes(
             [
                 _ordinary_tar_record("package/one.bin", b"one"),
@@ -5710,13 +6671,12 @@ class Issue123PrivacyScannerTest(unittest.TestCase):
         mismatches.append(changed)
         mismatches.append(infos[1])
 
-        for changed in mismatches:
-            with (
-                self.subTest(field=changed),
-                self.assertRaises(privacy.PrivacyError) as caught,
-            ):
-                privacy._reconcile_tar_member("fixture.tar", changed, ledger.members[0])
-            self.assertNotIn("private-marker", str(caught.exception))
+        changed_case_values = tuple(mismatches)
+        assert len(changed_case_values) == 7
+        changed = changed_case_values[changed_case]
+        with pytest.raises(privacy.PrivacyError) as caught:
+            privacy._reconcile_tar_member("fixture.tar", changed, ledger.members[0])
+        assert "private-marker" not in str(caught.value)
 
         for logical_members in ([], infos + [copy.deepcopy(infos[-1])]):
             fake_archive = mock.MagicMock()
@@ -5727,7 +6687,7 @@ class Issue123PrivacyScannerTest(unittest.TestCase):
             )
             with (
                 mock.patch.object(privacy.tarfile, "open", return_value=fake_archive),
-                self.assertRaisesRegex(privacy.PrivacyError, "membership differs"),
+                pytest.raises(privacy.PrivacyError, match="membership differs"),
             ):
                 privacy._scan_tar("fixture.tar", raw, ())
 
@@ -5738,12 +6698,12 @@ class Issue123PrivacyScannerTest(unittest.TestCase):
             mock.patch.object(
                 privacy.tarfile, "open", side_effect=RecursionError(marker)
             ),
-            self.assertRaisesRegex(
-                privacy.PrivacyError, "is not a valid tar payload"
+            pytest.raises(
+                privacy.PrivacyError, match="is not a valid tar payload"
             ) as caught,
         ):
             privacy.scan_payload("packages/recursive.tar", raw)
-        self.assertNotIn(marker, " ".join(_exception_messages(caught.exception)))
+        assert marker not in " ".join(_exception_messages(caught.value))
 
     def test_physical_tar_headers_and_helper_bodies_precede_logical_overrides(self):
         owner_stream = io.BytesIO()
@@ -5758,7 +6718,7 @@ class Issue123PrivacyScannerTest(unittest.TestCase):
             info.pax_headers = {"uid": "0", "gid": "0", "uname": "", "gname": ""}
             info.size = 4
             archive.addfile(info, io.BytesIO(b"safe"))
-        with self.assertRaisesRegex(privacy.PrivacyError, "physical tar owner"):
+        with pytest.raises(privacy.PrivacyError, match="physical tar owner"):
             privacy.scan_payload("packages/owner-override.tar", owner_stream.getvalue())
 
         pax_owner_stream = io.BytesIO()
@@ -5769,7 +6729,7 @@ class Issue123PrivacyScannerTest(unittest.TestCase):
             info.pax_headers = {"uid": "12345"}
             info.size = 4
             archive.addfile(info, io.BytesIO(b"safe"))
-        with self.assertRaisesRegex(privacy.PrivacyError, "owner identifiers"):
+        with pytest.raises(privacy.PrivacyError, match="owner identifiers"):
             privacy.scan_payload(
                 "packages/pax-owner-id.tar", pax_owner_stream.getvalue()
             )
@@ -5782,7 +6742,7 @@ class Issue123PrivacyScannerTest(unittest.TestCase):
             info.pax_headers = {"path": "package/data.bin"}
             info.size = 4
             archive.addfile(info, io.BytesIO(b"safe"))
-        with self.assertRaisesRegex(privacy.PrivacyError, "physical tar path"):
+        with pytest.raises(privacy.PrivacyError, match="physical tar path"):
             privacy._scan_tar("packages/path-override.tar", path_stream.getvalue(), ())
 
         nested_zip = _zip_bytes([])
@@ -5794,12 +6754,12 @@ class Issue123PrivacyScannerTest(unittest.TestCase):
             info.pax_headers = {"comment": nested_zip.decode("ascii")}
             info.size = 4
             archive.addfile(info, io.BytesIO(b"safe"))
-        with self.assertRaisesRegex(privacy.PrivacyError, "nested archive"):
+        with pytest.raises(privacy.PrivacyError, match="nested archive"):
             privacy.scan_payload("packages/pax-nested.tar", pax_stream.getvalue())
 
         gnu_helper = tarfile.TarInfo("././@LongLink")
         gnu_helper.type = tarfile.GNUTYPE_LONGNAME
-        with self.assertRaisesRegex(privacy.PrivacyError, "nested archive"):
+        with pytest.raises(privacy.PrivacyError, match="nested archive"):
             privacy._scan_tar_helper_body(
                 gnu_helper, nested_zip, "GNU helper fixture", ()
             )
@@ -5815,55 +6775,64 @@ class Issue123PrivacyScannerTest(unittest.TestCase):
 
     def test_embedded_gzip_candidate_work_is_capped_fail_closed(self):
         storm = b"\x1f\x8b\x08\xe0" * (privacy.MAX_EMBEDDED_ARCHIVE_CANDIDATES + 1)
-        with self.assertRaisesRegex(privacy.PrivacyError, "archive"):
+        with pytest.raises(privacy.PrivacyError, match="archive"):
             privacy.scan_payload(
                 "packages/signature-storm.bin",
                 storm,
                 media_type="application/octet-stream",
             )
 
-    def test_windows_nonportable_payload_aliases_are_rejected(self):
-        names = (
+    @pytest.mark.parametrize(
+        "name",
+        (
             "C:relative/evidence.bin",
             "evidence/CON.bin",
             "evidence/file.bin:stream.bin",
             "evidence/name./data.bin",
             "evidence/COM\N{SUPERSCRIPT ONE}.bin",
             "．．/evidence.bin",
-        )
-        for name in names:
-            with (
-                self.subTest(name=name),
-                self.assertRaisesRegex(privacy.PrivacyError, "portable"),
-            ):
-                privacy.scan_payload(
-                    name, b"safe", media_type="application/octet-stream"
-                )
+        ),
+        ids=(
+            "drive-relative",
+            "reserved-device",
+            "alternate-stream",
+            "trailing-dot",
+            "unicode-device-alias",
+            "nfkc-traversal",
+        ),
+    )
+    def test_windows_nonportable_payload_aliases_are_rejected(self, name):
+        with pytest.raises(privacy.PrivacyError, match="portable"):
+            privacy.scan_payload(name, b"safe", media_type="application/octet-stream")
 
-    def test_general_text_scans_apply_nfkc_and_casefold(self):
-        documents = (
-            {_fullwidth_ascii("hostname"): "samplehost"},
-            {"public_label": _fullwidth_ascii("C:/Users/sampleuser/private-location")},
-        )
-        for document in documents:
-            raw = json.dumps(
-                document,
+    @pytest.mark.parametrize(
+        "raw",
+        (
+            json.dumps(
+                {_fullwidth_ascii("hostname"): "samplehost"},
                 allow_nan=False,
                 ensure_ascii=False,
                 separators=(",", ":"),
                 sort_keys=True,
-            ).encode("utf-8")
-            with (
-                self.subTest(document=document),
-                self.assertRaises(privacy.PrivacyError),
-            ):
-                privacy.scan_public_bytes(raw)
-
-        utf16_alias = _fullwidth_ascii("PATH=/home/sampleuser/private").encode(
-            "utf-16-le"
-        )
-        with self.assertRaises(privacy.PrivacyError):
-            privacy.scan_public_bytes(utf16_alias)
+            ).encode("utf-8"),
+            json.dumps(
+                {
+                    "public_label": _fullwidth_ascii(
+                        "C:/Users/sampleuser/private-location"
+                    )
+                },
+                allow_nan=False,
+                ensure_ascii=False,
+                separators=(",", ":"),
+                sort_keys=True,
+            ).encode("utf-8"),
+            _fullwidth_ascii("PATH=/home/sampleuser/private").encode("utf-16-le"),
+        ),
+        ids=("nfkc-key", "casefolded-path", "utf16-assignment"),
+    )
+    def test_general_text_scans_apply_nfkc_and_casefold(self, raw):
+        with pytest.raises(privacy.PrivacyError):
+            privacy.scan_public_bytes(raw)
 
     def test_tar_owner_pax_trailer_and_gzip_expansion_are_closed(self):
         stream = io.BytesIO()
@@ -5874,13 +6843,13 @@ class Issue123PrivacyScannerTest(unittest.TestCase):
             raw = b"value = 1\n"
             info.size = len(raw)
             archive.addfile(info, io.BytesIO(raw))
-        with self.assertRaisesRegex(privacy.PrivacyError, "owner names") as caught:
+        with pytest.raises(privacy.PrivacyError, match="owner names") as caught:
             privacy.scan_payload(
                 "packages/owner.tar",
                 stream.getvalue(),
             )
-        self.assertNotIn("fixture-owner-invalid", str(caught.exception))
-        self.assertNotIn("fixture-group-invalid", str(caught.exception))
+        assert "fixture-owner-invalid" not in str(caught.value)
+        assert "fixture-group-invalid" not in str(caught.value)
 
         stream = io.BytesIO()
         with tarfile.open(
@@ -5891,7 +6860,7 @@ class Issue123PrivacyScannerTest(unittest.TestCase):
             raw = b"value = 1\n"
             info.size = len(raw)
             archive.addfile(info, io.BytesIO(raw))
-        with self.assertRaises(privacy.PrivacyError):
+        with pytest.raises(privacy.PrivacyError):
             privacy.scan_payload("packages/pax.tar", stream.getvalue())
 
         stream = io.BytesIO()
@@ -5902,7 +6871,7 @@ class Issue123PrivacyScannerTest(unittest.TestCase):
             archive.addfile(info, io.BytesIO(raw))
         hidden = bytearray(stream.getvalue())
         hidden[-1] = 1
-        with self.assertRaisesRegex(privacy.PrivacyError, "trailer"):
+        with pytest.raises(privacy.PrivacyError, match="trailer"):
             privacy.scan_payload("packages/trailing.tar", bytes(hidden))
 
         compressor = zlib.compressobj(wbits=16 + zlib.MAX_WBITS)
@@ -5910,11 +6879,18 @@ class Issue123PrivacyScannerTest(unittest.TestCase):
         original_bound = privacy.MAX_ARCHIVE_TOTAL_BYTES
         try:
             privacy.MAX_ARCHIVE_TOTAL_BYTES = 1024
-            with self.assertRaisesRegex(privacy.PrivacyError, "oversized"):
+            with pytest.raises(privacy.PrivacyError, match="oversized"):
                 privacy.scan_payload("packages/bomb.tar.gz", bomb)
         finally:
             privacy.MAX_ARCHIVE_TOTAL_BYTES = original_bound
 
 
-if __name__ == "__main__":
-    unittest.main()
+@contextmanager
+def issue123_privacy_fixture(fixture=None):
+    """Yield a privacy fixture with failure-safe patch restoration."""
+
+    if fixture is None:
+        fixture = _Issue123PrivacyFixture()
+    fixture.initialize()
+    with fixture.project_patcher:
+        yield fixture
